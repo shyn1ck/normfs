@@ -10,7 +10,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(NORMFS_UINTN_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/../../uintn-rs/c/include"
     CACHE PATH "Path to the uintn C include directory")
 
-add_library(normfs_c STATIC src/disk_monitor.c src/disk_monitor_sys.c src/frame.c)
+add_library(normfs_c STATIC src/disk_monitor.c src/disk_monitor_sys.c src/frame.c
+    src/request.c)
 target_include_directories(normfs_c PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${NORMFS_UINTN_INCLUDE}>
@@ -114,6 +115,47 @@ if(FRAMAC)
             src/frame.c
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         COMMENT "WP: normfs TCP frame header"
+        VERBATIM
+    )
+
+    set(NORMFS_REQUEST_WP_FCTS
+        normfs_uintn_varint64_size
+        normfs_uintn_varint64_decode_ok
+        normfs_uintn_varint64_decode
+        normfs_request_varint
+        normfs_request_key
+        normfs_request_len
+        normfs_request_skip
+        normfs_request_decode_id
+        normfs_request_decode_offset
+        normfs_request_decode_setup
+        normfs_request_decode_ping
+        normfs_request_decode_write
+        normfs_request_decode_packed
+        normfs_request_decode_read
+        normfs_request_decode)
+    string(REPLACE ";" "," NORMFS_REQUEST_WP_FCTS_ARG "${NORMFS_REQUEST_WP_FCTS}")
+
+    add_custom_target(verify-request
+        COMMAND ${FRAMAC}
+            -machdep gcc_x86_64
+            -wp-report-json ${CMAKE_CURRENT_BINARY_DIR}/verify-request.json
+            -wp -wp-rte -wp-timeout 240
+            -wp-split -wp-split-conj
+            -wp-prover alt-ergo,z3
+            -wp-par ${NPROC}
+            -wp-cache none
+            -wp-cache-env
+            -wp-smoke-tests
+            -wp-msg-key shell
+            -kernel-warn-key annot:missing-spec=inactive
+            -wp-warn-key pedantic-assigns=inactive
+            -wp-no-warn-memory-model
+            -cpp-extra-args=-I${CMAKE_CURRENT_SOURCE_DIR}/include\ -I${NORMFS_UINTN_INCLUDE}
+            -wp-fct ${NORMFS_REQUEST_WP_FCTS_ARG}
+            src/request.c
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "WP: normfs TCP client request decoder"
         VERBATIM
     )
 endif()
