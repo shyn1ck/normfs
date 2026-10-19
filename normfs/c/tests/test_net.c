@@ -1,5 +1,6 @@
 /*
- * The socket syscalls behind normfs/net_sys.h, on loopback.
+ * src/net.c is proved, but the socket syscalls it reaches are assumed
+ * contracts in normfs/net_sys.h. These tests discharge them on loopback.
  */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE 1
@@ -16,6 +17,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "normfs/net.h"
 #include "normfs/net_sys.h"
 
 /* assert() is a no-op under NDEBUG, which the Release build defines. */
@@ -73,6 +75,14 @@ main(void)
 	struct normfs_net_sys_addr v6 = {{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, 0, 0, 6};
 	struct normfs_net_sys_addr bound;
 	struct normfs_net_sys_accepted acc;
+	struct normfs_net_reader r;
+	struct normfs_net_result res;
+	uint8_t frame[8 + 5] = {5, 0, 0, 0, 0, 0, 0, 0, 'h', 'e', 'l', 'l', 'o'};
+	uint8_t payload[5];
+	uint8_t big[1 << 20];
+	uint8_t sink[65536];
+	size_t off;
+	int rounds;
 	int os_error, lfd, client, value;
 	socklen_t len;
 
@@ -88,6 +98,7 @@ main(void)
 
 	client = connect_to(&bound);
 	CHECK(client >= 0);
+	CHECK(fcntl(client, F_SETFL, fcntl(client, F_GETFL) | O_NONBLOCK) == 0);
 	wait_fd(lfd, POLLIN);
 	CHECK(normfs_net_sys_accept(lfd, &acc, &os_error) == 1 && os_error == 0);
 	CHECK(acc.fd >= 0 && acc.peer.family == 4 && acc.peer.port != 0 &&
@@ -102,7 +113,83 @@ main(void)
 	CHECK(getsockopt(acc.fd, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &value, &len) == 0 &&
 	    value == 128 * 1024);
 #endif
+
+	normfs_net_reader_init(&r);
+	res = normfs_net_read_header(&r, acc.fd);
+	CHECK(res.status == NORMFS_NET_WOULD_BLOCK && r.header_have == 0);
+
+	/* A header split over two writes, then the payload. */
+	CHECK(write(client, frame, 3) == 3);
+	wait_fd(acc.fd, POLLIN);
+	res = normfs_net_read_header(&r, acc.fd);
+	CHECK(res.status == NORMFS_NET_WOULD_BLOCK && r.header_have == 3);
+	CHECK(write(client, frame + 3, sizeof(frame) - 3) == (ssize_t)(sizeof(frame) - 3));
+	wait_fd(acc.fd, POLLIN);
+	res = normfs_net_read_header(&r, acc.fd);
+	CHECK(res.status == NORMFS_NET_OK && res.value == 5);
+	res = normfs_net_read_payload(&r, acc.fd, payload, sizeof(payload));
+	CHECK(res.status == NORMFS_NET_OK && memcmp(payload, "hello", 5) == 0);
+
+	/* Writes until the socket buffer is full, draining it in between. */
+	memset(big, 0xab, sizeof(big));
+	off = 0;
+	for (rounds = 0; rounds < 10000; rounds++) {
+		res = normfs_net_write(acc.fd, big, sizeof(big), &off);
+		if (res.status != NORMFS_NET_WOULD_BLOCK && res.status != NORMFS_NET_YIELD)
+			break;
+		while (read(client, sink, sizeof(sink)) > 0)
+			;
+		if (res.status == NORMFS_NET_WOULD_BLOCK)
+			wait_fd(acc.fd, POLLOUT);
+	}
+	CHECK(res.status == NORMFS_NET_OK && off == sizeof(big));
+
+	/* A clean close with nothing pending is the end of the stream. */
+	while (read(client, sink, sizeof(sink)) > 0)
+		;
+	CHECK(shutdown(client, SHUT_WR) == 0);
+	wait_fd(acc.fd, POLLIN);
+	res = normfs_net_read_header(&r, acc.fd);
+	CHECK(res.status == NORMFS_NET_EOF && res.os_error == 0);
+
+	/* Unread data on close makes a reset: writes fail, without raising
+	 * SIGPIPE. */
+	CHECK(write(acc.fd, "x", 1) == 1);
+	wait_fd(client, POLLIN);
 	close(client);
+	off = 0;
+	for (rounds = 0; rounds < 10000; rounds++) {
+		res = normfs_net_write(acc.fd, big, sizeof(big), &off);
+		if (res.status == NORMFS_NET_ERR_IO)
+			break;
+		if (res.status == NORMFS_NET_OK)
+			off = 0;
+		if (res.status == NORMFS_NET_WOULD_BLOCK)
+			wait_fd(acc.fd, POLLOUT);
+	}
+	CHECK(res.status == NORMFS_NET_ERR_IO && res.os_error > 0);
+
+	normfs_net_sys_shutdown_write(acc.fd);
+	normfs_net_sys_close(acc.fd);
+
+	/* SO_LINGER 0 closes with a reset, which the next read reports. */
+	client = connect_to(&bound);
+	CHECK(client >= 0);
+	wait_fd(lfd, POLLIN);
+	CHECK(normfs_net_sys_accept(lfd, &acc, &os_error) == 1);
+	{
+		struct linger lg = {1, 0};
+		CHECK(setsockopt(client, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)) == 0);
+	}
+	close(client);
+	normfs_net_reader_init(&r);
+	for (rounds = 0; rounds < 100; rounds++) {
+		wait_fd(acc.fd, POLLIN);
+		res = normfs_net_read_header(&r, acc.fd);
+		if (res.status != NORMFS_NET_WOULD_BLOCK)
+			break;
+	}
+	CHECK(res.status == NORMFS_NET_ERR_IO && res.os_error > 0);
 	normfs_net_sys_close(acc.fd);
 
 	/* A port already taken. */
