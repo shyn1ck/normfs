@@ -9,6 +9,9 @@ mod net;
 mod request;
 #[cfg(test)]
 mod request_test;
+mod response;
+#[cfg(test)]
+mod response_test;
 
 #[cfg(feature = "websocket")]
 pub mod websocket;
