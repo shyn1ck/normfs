@@ -6,6 +6,9 @@ mod frame;
 #[cfg(test)]
 mod frame_test;
 mod net;
+mod request;
+#[cfg(test)]
+mod request_test;
 
 #[cfg(feature = "websocket")]
 pub mod websocket;
