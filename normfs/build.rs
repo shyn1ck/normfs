@@ -40,6 +40,7 @@ fn main() -> Result<()> {
         manifest_dir.join("c/src/net.c"),
         manifest_dir.join("c/src/net_sys.c"),
         manifest_dir.join("c/src/request.c"),
+        manifest_dir.join("c/src/response.c"),
     ];
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rustc-link-lib=ntdll");
