@@ -61,6 +61,57 @@ async fn publish_lands_the_bytes_and_leaves_no_temp() {
 }
 
 #[tokio::test]
+async fn publish_replaces_a_file_a_reader_holds_open() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fs = fs();
+    let tmp = dir.path().join("a.tmp");
+    let dst = dir.path().join("a.store");
+    let spec = |body: &[u8]| PublishSpec {
+        tmp: tmp.clone(),
+        dst: dst.clone(),
+        runs: runs(&[body]),
+        tmp_mode: TmpMode::Excl,
+        sync: true,
+    };
+    fs.publish(spec(b"old"), None).await.unwrap();
+    let mut reader = fs::File::open(&dst).unwrap();
+
+    fs.publish(spec(b"new"), None).await.unwrap();
+    assert_eq!(fs::read(&dst).unwrap(), b"new");
+    let mut held = Vec::new();
+    reader.read_to_end(&mut held).unwrap();
+    assert_eq!(held, b"old");
+}
+
+#[tokio::test]
+async fn publish_lands_below_a_path_past_the_windows_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = fs();
+    let mut deep = dir.path().to_path_buf();
+    for _ in 0..6 {
+        deep.push("d".repeat(50));
+    }
+    fs::create_dir_all(&deep).unwrap();
+    let dst = deep.join("a.store");
+    assert!(dst.as_os_str().len() > 300);
+    fs.publish(
+        PublishSpec {
+            tmp: deep.join("a.tmp"),
+            dst: dst.clone(),
+            runs: runs(&[b"deep"]),
+            tmp_mode: TmpMode::Excl,
+            sync: true,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(&dst).unwrap(), b"deep");
+}
+
+#[tokio::test]
 async fn publish_failure_reports_errno_and_cleans_up() {
     let dir = tempfile::tempdir().unwrap();
     let fs = fs();
