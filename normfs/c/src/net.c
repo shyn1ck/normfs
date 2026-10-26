@@ -78,7 +78,7 @@ normfs_net_result(int status, int os_error, uint64_t value)
               r->payload_have == \old(r->payload_have);
 */
 struct normfs_net_result
-normfs_net_read_header(struct normfs_net_reader *r, int fd)
+normfs_net_read_header(struct normfs_net_reader *r, normfs_net_fd fd)
 {
 	struct normfs_frame_decode_result h;
 	int os_error = 0;
@@ -161,7 +161,7 @@ normfs_net_read_header(struct normfs_net_reader *r, int fd)
               normfs_net_payload_read(buf, len, fd);
 */
 struct normfs_net_result
-normfs_net_read_payload(struct normfs_net_reader *r, int fd, uint8_t *buf,
+normfs_net_read_payload(struct normfs_net_reader *r, normfs_net_fd fd, uint8_t *buf,
     size_t len)
 {
 	int os_error = 0;
@@ -227,7 +227,7 @@ normfs_net_read_payload(struct normfs_net_reader *r, int fd, uint8_t *buf,
               net_out(fd, i) == \old(net_out(fd, i));
 */
 struct normfs_net_result
-normfs_net_write(int fd, const uint8_t *buf, size_t len, size_t *off)
+normfs_net_write(normfs_net_fd fd, const uint8_t *buf, size_t len, size_t *off)
 {
 	int os_error = 0;
 	int calls = 0;

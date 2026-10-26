@@ -43,7 +43,7 @@ normfs_net_sys_would_block(int e)
 }
 
 long
-normfs_net_sys_read(int fd, uint8_t *buf, size_t off, size_t len, int *os_error)
+normfs_net_sys_read(normfs_net_fd fd, uint8_t *buf, size_t off, size_t len, int *os_error)
 {
 	ssize_t n;
 
@@ -62,7 +62,7 @@ normfs_net_sys_read(int fd, uint8_t *buf, size_t off, size_t len, int *os_error)
 }
 
 long
-normfs_net_sys_write(int fd, const uint8_t *buf, size_t off, size_t len,
+normfs_net_sys_write(normfs_net_fd fd, const uint8_t *buf, size_t off, size_t len,
     int *os_error)
 {
 	ssize_t n;
@@ -87,7 +87,7 @@ normfs_net_sys_write(int fd, const uint8_t *buf, size_t off, size_t len,
 
 #if !(defined(SOCK_CLOEXEC) && defined(SOCK_NONBLOCK))
 static int
-normfs_net_sys_nonblocking(int fd)
+normfs_net_sys_nonblocking(normfs_net_fd fd)
 {
 	int flags = fcntl(fd, F_GETFL);
 
@@ -140,13 +140,13 @@ normfs_net_sys_from_sockaddr(const struct sockaddr_storage *ss,
 	}
 }
 
-int
+normfs_net_fd
 normfs_net_sys_listen(const struct normfs_net_sys_addr *addr, int *os_error)
 {
 	struct sockaddr_storage ss;
 	socklen_t ss_len = normfs_net_sys_to_sockaddr(addr, &ss);
 	int one = 1;
-	int fd;
+	normfs_net_fd fd;
 
 	*os_error = 0;
 #if defined(SOCK_CLOEXEC) && defined(SOCK_NONBLOCK)
@@ -175,7 +175,7 @@ normfs_net_sys_listen(const struct normfs_net_sys_addr *addr, int *os_error)
 }
 
 int
-normfs_net_sys_local_addr(int fd, struct normfs_net_sys_addr *addr, int *os_error)
+normfs_net_sys_local_addr(normfs_net_fd fd, struct normfs_net_sys_addr *addr, int *os_error)
 {
 	struct sockaddr_storage ss;
 	socklen_t len = sizeof(ss);
@@ -190,7 +190,7 @@ normfs_net_sys_local_addr(int fd, struct normfs_net_sys_addr *addr, int *os_erro
 }
 
 int
-normfs_net_sys_accept(int fd, struct normfs_net_sys_accepted *out, int *os_error)
+normfs_net_sys_accept(normfs_net_fd fd, struct normfs_net_sys_accepted *out, int *os_error)
 {
 	struct sockaddr_storage ss;
 	socklen_t len;
@@ -246,13 +246,13 @@ normfs_net_sys_accept(int fd, struct normfs_net_sys_accepted *out, int *os_error
 }
 
 void
-normfs_net_sys_shutdown_write(int fd)
+normfs_net_sys_shutdown_write(normfs_net_fd fd)
 {
 	(void)shutdown(fd, SHUT_WR);
 }
 
 void
-normfs_net_sys_close(int fd)
+normfs_net_sys_close(normfs_net_fd fd)
 {
 	/* Not retried on EINTR: the descriptor is released either way. */
 	(void)close(fd);
