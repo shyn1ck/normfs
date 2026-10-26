@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <io.h>
+#include <share.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -70,8 +71,7 @@ normfs_seed_sys_open(const char *path, size_t path_len, int flags, int *os_error
 	}
 
 	_set_doserrno(0);
-	fd = _wopen(wide, flags, _S_IREAD | _S_IWRITE);
-	if (fd < 0)
+	if (_wsopen_s(&fd, wide, flags, _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0 || fd < 0)
 		return normfs_seed_sys_fail(os_error);
 	return fd;
 }

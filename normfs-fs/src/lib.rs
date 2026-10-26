@@ -23,6 +23,7 @@ mod dir_sync;
 mod directory;
 mod executor;
 pub mod fault;
+mod os;
 mod plan;
 mod pool;
 mod read;
@@ -570,8 +571,7 @@ impl Fs {
 }
 
 fn inode(file: &File) -> io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(file.metadata()?.ino())
+    os::inode(file)
 }
 
 fn finished(plan: &Plan) -> Result<(), FsError> {

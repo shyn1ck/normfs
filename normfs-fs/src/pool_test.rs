@@ -365,6 +365,7 @@ async fn bounded_admission_waits_and_cancellation_does_not_submit() {
     assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn publish_rejects_a_dangling_temp_symlink_to_the_destination() {
     let dir = tempfile::tempdir().unwrap();
@@ -422,8 +423,7 @@ async fn cached_inode_append_submits_exactly_one_job() {
         .await
         .unwrap();
     let file = Arc::new(file);
-    use std::os::unix::fs::MetadataExt;
-    assert_eq!(inode, fs.metadata(file.clone()).await.unwrap().ino());
+    assert_eq!(inode, crate::os::inode(&file).unwrap());
     submissions.store(0, Ordering::SeqCst);
     assert!(matches!(
         fs.append_sync_with_inode(file, inode, &path, 6, runs(&[b"batch"]), true)
