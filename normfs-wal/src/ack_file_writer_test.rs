@@ -638,6 +638,8 @@ async fn an_entry_buffered_during_a_flush_is_not_acked_by_it() {
         );
     };
 
+    // The last ack may come before close, while the loop below still drains.
+    let mut highest = None;
     const ENTRIES: u64 = 20;
     for i in 0..ENTRIES {
         let body = Bytes::from(payload(i));
@@ -651,7 +653,8 @@ async fn an_entry_buffered_during_a_flush_is_not_acked_by_it() {
                 .windows(body.len())
                 .any(|w| w == &body[..]);
             while let Ok((_, id)) = ack_receiver.try_recv() {
-                assert_acked_bytes_on_disk(id);
+                assert_acked_bytes_on_disk(id.clone());
+                highest = highest.max(Some(id.to_u64().unwrap()));
             }
             if on_disk {
                 break;
@@ -665,10 +668,9 @@ async fn an_entry_buffered_during_a_flush_is_not_acked_by_it() {
     }
 
     writer.close().await.unwrap();
-    let mut highest = None;
     while let Ok((_, id)) = ack_receiver.try_recv() {
         assert_acked_bytes_on_disk(id.clone());
-        highest = Some(id.to_u64().unwrap());
+        highest = highest.max(Some(id.to_u64().unwrap()));
     }
     assert_eq!(
         highest,
