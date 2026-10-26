@@ -1,0 +1,29 @@
+name: windows-probe
+on:
+  push:
+    branches: [ci/windows-probe]
+  workflow_dispatch:
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, x86_64-pc-windows-gnu]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: choco install protoc -y --no-progress
+      - name: test
+        shell: bash
+        run: |
+          cargo test --target ${{ matrix.target }} ${PROBE_ARGS:---workspace} --no-fail-fast > test.log 2>&1 || true
+          { grep -E "^test .* FAILED|panicked at|^error" test.log | sort | uniq -c | head -80; } || true
+          { grep -E "^---- " -A14 test.log | head -300; } || true
+          grep -E "^test result" test.log | awk '{p+=$4; f+=$6} END {print "TOTAL passed", p, "failed", f}'
+        env:
+          PROBE_ARGS: -p normfs-fs
