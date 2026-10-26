@@ -4,6 +4,15 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* cl knows no GNU attributes. The ones here and in generated code only steer
+ * inlining and mark functions that may go unused, so under cl they go, and
+ * so does the warning that unused static functions get there. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define __attribute__(x)
+#define __restrict__ __restrict
+#pragma warning(disable : 4505)
+#endif
+
 /*
  *               .'\   /`.
  *             .'.-.`-'.-.`.
