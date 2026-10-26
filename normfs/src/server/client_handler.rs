@@ -510,11 +510,13 @@ impl Driver {
             let e = self.sides.events[k];
             match e.kind {
                 EV_NEED_BUFFER => {
-                    let mut payload = vec![0u8; e.value as usize];
+                    let mut payload = self.buffer.take().unwrap_or_default();
+                    payload.resize(e.value as usize, 0);
                     let now = self.now();
                     let rx = self.sides.rx();
-                    // SAFETY: payload holds the bytes asked for and stays in self.buffer,
-                    // unmoved, until the REQUEST or READ_CLOSED event gives it back.
+                    // SAFETY: payload holds the bytes asked for, those read so far at its
+                    // start, and stays in self.buffer unmoved until the next NEED_BUFFER,
+                    // REQUEST or READ_CLOSED event.
                     unsafe { normfs_conn_give_buffer(rx, payload.as_mut_ptr(), now) };
                     self.buffer = Some(payload);
                     gave = true;
