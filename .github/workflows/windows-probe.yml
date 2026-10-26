@@ -6,24 +6,31 @@ on:
 env:
   CARGO_TERM_COLOR: never
 jobs:
-  probe:
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [x86_64-pc-windows-msvc, x86_64-pc-windows-gnu]
+  live:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
         with:
-          targets: ${{ matrix.target }}
+          go-version: stable
+          cache: false
       - run: choco install protoc -y --no-progress
-      - name: test
+      - name: build server
+        run: cargo build --release -p normfs --features server-bin --bin normfs-server
+      - name: run server and clients
         shell: bash
         run: |
-          cargo test --target ${{ matrix.target }} ${PROBE_ARGS:---workspace} --no-fail-fast > test.log 2>&1 || true
-          { grep -E "^test .* FAILED|panicked at|^error" test.log | sort | uniq -c | head -80; } || true
-          { grep -E "^---- " -A14 test.log | head -300; } || true
-          grep -E "^test result" test.log | awk '{p+=$4; f+=$6} END {print "TOTAL passed", p, "failed", f}'
-        env:
-          PROBE_ARGS: --workspace
+          ./target/release/normfs-server.exe --data-dir "$RUNNER_TEMP/nfs" > srv.log 2>&1 &
+          sleep 8
+          echo "== go client: 1 KiB writes and reads"
+          (cd normfs_go/bench && go run ./cmd/benchmark --clients=4 --iterations=3000 --size=1024 --queue=bench/win --addr=127.0.0.1:8888) 2>&1 | tail -15
+          echo "== go client: 64 KiB"
+          (cd normfs_go/bench && go run ./cmd/benchmark --clients=2 --iterations=500 --size=65536 --queue=bench/win64 --addr=127.0.0.1:8888) 2>&1 | tail -8
+          echo "== tcp behaviour"
+          python .github/probe/live.py e2e
+          echo "== data dir"
+          find "$RUNNER_TEMP/nfs" -maxdepth 4 | head -30
+          echo "== server log"
+          grep -E "ERROR|WARN|panick" srv.log | head -20 || true
+          tail -5 srv.log

@@ -58,6 +58,8 @@
 #define NORMFS_CRC32C_STEP1(c, b) ((uint32_t)_mm_crc32_u8((c), (b)))
 #include <nmmintrin.h>
 #include <string.h>
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+#error "Windows on arm64 is not a supported target"
 #endif
 
 #endif

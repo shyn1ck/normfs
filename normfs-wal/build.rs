@@ -34,8 +34,10 @@ fn main() {
         .include(&uintn_include_dir)
         .opt_level(3);
 
+    // clang-cl is cl to cc but clang to crc32c.c, which wants SSE4.2 enabled.
+    let compiler = build.get_compiler();
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
-        && !build.get_compiler().is_like_msvc()
+        && (!compiler.is_like_msvc() || compiler.is_like_clang_cl())
     {
         build.flag("-msse4.2");
     }
