@@ -1119,18 +1119,18 @@ gremlin_skip_data(const uint8_t *buf, size_t len, enum gremlin_wire_type wt)
 			}
 			offset += t.consumed;
 
-			unsigned wt = (unsigned)(t.value % 8u);
-			if (wt == 6u || wt == 7u) {
+			unsigned inner_wt = (unsigned)(t.value % 8u);
+			if (inner_wt == 6u || inner_wt == 7u) {
 				r.error = GREMLIN_ERROR_INVALID_WIRE_TYPE;
 				r.consumed = 0;
 				return r;
 			}
 
-			if (wt == GREMLIN_WIRE_SGROUP) {
+			if (inner_wt == GREMLIN_WIRE_SGROUP) {
 				depth++;
 				continue;
 			}
-			if (wt == GREMLIN_WIRE_EGROUP) {
+			if (inner_wt == GREMLIN_WIRE_EGROUP) {
 				depth--;
 				continue;
 			}
@@ -1140,15 +1140,15 @@ gremlin_skip_data(const uint8_t *buf, size_t len, enum gremlin_wire_type wt)
 			 * cleaner but complicates WP termination; the duplication
 			 * is small and obviously bounded. */
 			size_t remain = len - offset;
-			if (wt == GREMLIN_WIRE_VARINT) {
+			if (inner_wt == GREMLIN_WIRE_VARINT) {
 				struct gremlin_varint_decode_result d =
 					gremlin_varint_decode(buf + offset, remain);
 				if (d.error != GREMLIN_OK) { r.error = d.error; r.consumed = 0; return r; }
 				offset += d.consumed;
-			} else if (wt == GREMLIN_WIRE_FIXED32) {
+			} else if (inner_wt == GREMLIN_WIRE_FIXED32) {
 				if (remain < 4) { r.error = GREMLIN_ERROR_TRUNCATED; r.consumed = 0; return r; }
 				offset += 4;
-			} else if (wt == GREMLIN_WIRE_FIXED64) {
+			} else if (inner_wt == GREMLIN_WIRE_FIXED64) {
 				if (remain < 8) { r.error = GREMLIN_ERROR_TRUNCATED; r.consumed = 0; return r; }
 				offset += 8;
 			} else {
