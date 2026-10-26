@@ -16,14 +16,17 @@ mod response_test;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
-use log::{info, warn};
+use log::{error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::NormFS;
 use client_handler::ClientHandler;
 pub use command_processor::{CommandProcessor, ResponseSender};
 use net::Listener;
+
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 pub struct Server {
     normfs: Arc<NormFS>,
@@ -44,7 +47,16 @@ impl Server {
 
     pub async fn run(&self) -> Result<(), std::io::Error> {
         loop {
-            let accepted = self.listener.accept().await?;
+            let accepted = match self.listener.accept().await {
+                Ok(accepted) => accepted,
+                // These clear up as connections close; any other error means the listener broke.
+                Err(e) if out_of_resources(&e) => {
+                    error!("Failed to accept connection (error: {})", e);
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let addr = accepted.peer;
             info!("Accepted connection from {}", addr);
             if let Some(e) = accepted.nodelay_error {
@@ -67,4 +79,11 @@ impl Server {
             });
         }
     }
+}
+
+fn out_of_resources(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
 }
