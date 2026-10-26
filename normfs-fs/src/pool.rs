@@ -187,7 +187,7 @@ fn drive(plan: &mut Plan, res: &Resources) -> Result<Driven, FsError> {
         match (owned, &res.file) {
             (Some(fd), _) => os::raw(fd),
             (None, Some(f)) => os::raw(f.as_ref()),
-            (None, None) => -1,
+            (None, None) => os::NO_FD,
         }
     };
 

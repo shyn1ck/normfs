@@ -13,8 +13,9 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <string.h>
+#include <wchar.h>
 
-#include "normfs/seed.h"
 #include "normfs/seed_sys.h"
 
 static int
@@ -27,20 +28,58 @@ normfs_seed_sys_fail(int *os_error)
 	return -1;
 }
 
-/* Paths arrive as UTF-8; the ANSI calls would read them in the local code page. */
-static int
-normfs_seed_sys_widen(const char *path, size_t path_len, wchar_t *out)
+/*
+ * UTF-8 in, a full \\?\ path out: the ANSI calls would read the bytes in the
+ * local code page, and without the prefix a path past 260 characters fails
+ * as if absent. The caller frees it.
+ */
+static wchar_t *
+normfs_seed_sys_wpath(const char *path, size_t path_len)
 {
-	int n;
+	wchar_t *rel;
+	wchar_t *full;
+	wchar_t *p;
+	DWORD need;
+	DWORD got;
+	int n = 0;
 
-	if (path_len == 0u)
-		return -1;
-	n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, (int)path_len,
-	    out, (int)path_len);
-	if (n <= 0)
-		return -1;
-	out[n] = L'\0';
-	return 0;
+	rel = malloc((path_len + 1u) * sizeof(wchar_t));
+	if (rel == NULL)
+		return NULL;
+	if (path_len > 0u)
+		n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, (int)path_len,
+		    rel, (int)path_len);
+	if (n <= 0) {
+		free(rel);
+		return NULL;
+	}
+	rel[n] = L'\0';
+
+	need = GetFullPathNameW(rel, 0u, NULL, NULL);
+	full = need > 0u ? malloc((need + 8u) * sizeof(wchar_t)) : NULL;
+	if (full == NULL) {
+		free(rel);
+		return NULL;
+	}
+	/* Seven characters of room in front for "\\?\UNC". */
+	p = full + 7;
+	got = GetFullPathNameW(rel, need, p, NULL);
+	free(rel);
+	if (got == 0u || got >= need) {
+		free(full);
+		return NULL;
+	}
+
+	if (p[0] == L'\\' && p[1] == L'\\' && (p[2] == L'?' || p[2] == L'.')) {
+		memmove(full, p, (wcslen(p) + 1u) * sizeof(wchar_t));
+	} else if (p[0] == L'\\' && p[1] == L'\\') {
+		memmove(full + 7, p + 1, wcslen(p + 1) * sizeof(wchar_t) + sizeof(wchar_t));
+		memcpy(full, L"\\\\?\\UNC", 7u * sizeof(wchar_t));
+	} else {
+		memmove(full + 4, p, (wcslen(p) + 1u) * sizeof(wchar_t));
+		memcpy(full, L"\\\\?\\", 4u * sizeof(wchar_t));
+	}
+	return full;
 }
 
 int
@@ -61,18 +100,23 @@ normfs_seed_sys_entropy(uint8_t *buf, size_t len, int *os_error)
 static int
 normfs_seed_sys_open(const char *path, size_t path_len, int flags, int *os_error)
 {
-	wchar_t wide[NORMFS_SEED_PATH_MAX + 1];
+	wchar_t *wide;
 	int fd;
 
 	*os_error = 0;
-	if (normfs_seed_sys_widen(path, path_len, wide) != 0) {
+	wide = normfs_seed_sys_wpath(path, path_len);
+	if (wide == NULL) {
 		*os_error = ERROR_INVALID_NAME;
 		return -1;
 	}
 
 	_set_doserrno(0);
-	if (_wsopen_s(&fd, wide, flags, _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0 || fd < 0)
-		return normfs_seed_sys_fail(os_error);
+	if (_wsopen_s(&fd, wide, flags, _SH_DENYNO, _S_IREAD | _S_IWRITE) != 0 || fd < 0) {
+		(void)normfs_seed_sys_fail(os_error);
+		free(wide);
+		return -1;
+	}
+	free(wide);
 	return fd;
 }
 
@@ -151,12 +195,16 @@ normfs_seed_sys_close(int fd, int *os_error)
 int
 normfs_seed_sys_exists(const char *path, size_t path_len)
 {
-	wchar_t wide[NORMFS_SEED_PATH_MAX + 1];
 	struct _stat64 st;
+	wchar_t *wide;
+	int found;
 
-	if (normfs_seed_sys_widen(path, path_len, wide) != 0)
+	wide = normfs_seed_sys_wpath(path, path_len);
+	if (wide == NULL)
 		return 0;
-	return _wstat64(wide, &st) == 0;
+	found = _wstat64(wide, &st) == 0;
+	free(wide);
+	return found;
 }
 
 void

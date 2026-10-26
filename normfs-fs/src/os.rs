@@ -27,6 +27,12 @@ pub(crate) type SysFd = std::os::raw::c_int;
 #[cfg(windows)]
 pub(crate) type SysFd = isize;
 
+/// No descriptor; on Windows -1 would be the current process's handle.
+#[cfg(unix)]
+pub(crate) const NO_FD: SysFd = -1;
+#[cfg(windows)]
+pub(crate) const NO_FD: SysFd = 0;
+
 #[cfg(unix)]
 pub(crate) type OwnedSysFd = std::os::fd::OwnedFd;
 #[cfg(windows)]
@@ -105,5 +111,8 @@ pub(crate) fn inode(file: &File) -> io::Result<u64> {
     if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow))
+    match (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow) {
+        0 => Err(io::Error::new(io::ErrorKind::InvalidData, "file index 0")),
+        ino => Ok(ino),
+    }
 }

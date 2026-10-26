@@ -26,4 +26,4 @@ jobs:
           { grep -E "^---- " -A14 test.log | head -300; } || true
           grep -E "^test result" test.log | awk '{p+=$4; f+=$6} END {print "TOTAL passed", p, "failed", f}'
         env:
-          PROBE_ARGS: -p normfs-fs
+          PROBE_ARGS: --workspace
