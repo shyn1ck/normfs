@@ -28,6 +28,9 @@ fn main() -> Result<()> {
             },
         ),
     ];
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=ntdll");
+    }
 
     println!("cargo:rerun-if-changed={}", include_dir.display());
     for source in &sources {

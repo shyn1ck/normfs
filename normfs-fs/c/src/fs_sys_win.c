@@ -180,8 +180,8 @@ normfs_fs_sys_is_link(const wchar_t *path, DWORD attrs)
 }
 
 /* FILE_SHARE_DELETE lets a later publish replace, or a cleanup remove, a
- * file a reader still has open, as on Unix. A link at the path is refused,
- * as O_NOFOLLOW refuses it. */
+ * file a reader still has open, as on Unix. A link already at the path is
+ * refused, checked just before the open rather than by it as O_NOFOLLOW is. */
 normfs_fs_fd
 normfs_fs_sys_open_create(const char *path, size_t path_len, int mode,
 	uint64_t *ino, int *os_error)
@@ -352,9 +352,10 @@ normfs_fs_sys_rename(const char *src, size_t src_len, const char *dst,
 	h = CreateFileW(wsrc, DELETE | SYNCHRONIZE,
 	    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
 	    FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		(void)normfs_fs_sys_fail(os_error);
 	free(wsrc);
 	if (h == INVALID_HANDLE_VALUE) {
-		(void)normfs_fs_sys_fail(os_error);
 		free(wdst);
 		return -1;
 	}

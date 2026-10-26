@@ -13,7 +13,9 @@
 #elif (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__) || \
     defined(_MSC_VER)
 
-#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#if defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__))
+#error "Windows on arm64 is not a supported target"
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
 #define NORMFS_CRC32C_ARM 1
 #define NORMFS_CRC32C_HW 1
 #define NORMFS_CRC32C_HW_TARGET
@@ -58,8 +60,6 @@
 #define NORMFS_CRC32C_STEP1(c, b) ((uint32_t)_mm_crc32_u8((c), (b)))
 #include <nmmintrin.h>
 #include <string.h>
-#elif defined(_MSC_VER) && defined(_M_ARM64)
-#error "Windows on arm64 is not a supported target"
 #endif
 
 #endif

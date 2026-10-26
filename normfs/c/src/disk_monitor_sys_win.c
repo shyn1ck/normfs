@@ -44,7 +44,8 @@ normfs_disk_sys_absent(DWORD e)
  * prefix a path past 260 characters fails as if absent. The caller frees it.
  */
 static wchar_t *
-normfs_disk_sys_wpath(const char *path, size_t path_len, size_t extra)
+normfs_disk_sys_wpath(const char *path, size_t path_len, size_t extra,
+    int *os_error)
 {
 	wchar_t *rel;
 	wchar_t *full;
@@ -55,7 +56,7 @@ normfs_disk_sys_wpath(const char *path, size_t path_len, size_t extra)
 
 	rel = malloc((path_len + 1u) * sizeof(wchar_t));
 	if (rel == NULL) {
-		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		*os_error = ERROR_NOT_ENOUGH_MEMORY;
 		return NULL;
 	}
 	if (path_len > 0u)
@@ -63,27 +64,33 @@ normfs_disk_sys_wpath(const char *path, size_t path_len, size_t extra)
 		    rel, (int)path_len);
 	if (n <= 0) {
 		free(rel);
-		SetLastError(ERROR_INVALID_NAME);
+		*os_error = ERROR_INVALID_NAME;
 		return NULL;
 	}
 	rel[n] = L'\0';
 
 	need = GetFullPathNameW(rel, 0u, NULL, NULL);
-	full = need > 0u ? malloc((need + 8u + extra) * sizeof(wchar_t)) : NULL;
+	if (need == 0u) {
+		(void)normfs_disk_sys_fail(os_error);
+		free(rel);
+		return NULL;
+	}
+	full = malloc((need + 8u + extra) * sizeof(wchar_t));
 	if (full == NULL) {
 		free(rel);
-		if (need > 0u)
-			SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		*os_error = ERROR_NOT_ENOUGH_MEMORY;
 		return NULL;
 	}
 	/* Seven characters of room in front for "\\?\UNC". */
 	p = full + 7;
 	got = GetFullPathNameW(rel, need, p, NULL);
-	free(rel);
 	if (got == 0u || got >= need) {
+		(void)normfs_disk_sys_fail(os_error);
+		free(rel);
 		free(full);
 		return NULL;
 	}
+	free(rel);
 
 	if (p[0] == L'\\' && p[1] == L'\\' && (p[2] == L'?' || p[2] == L'.')) {
 		memmove(full, p, (wcslen(p) + 1u) * sizeof(wchar_t));
@@ -95,6 +102,22 @@ normfs_disk_sys_wpath(const char *path, size_t path_len, size_t extra)
 		memcpy(full, L"\\\\?\\", 4u * sizeof(wchar_t));
 	}
 	return full;
+}
+
+/* From ntdll: the NTSTATUS behind the last error, which tells a file pending
+ * deletion apart from one access is denied to. */
+__declspec(dllimport) LONG __stdcall RtlGetLastNtStatus(void);
+#define NORMFS_DISK_STATUS_DELETE_PENDING ((LONG)0xC0000056L)
+
+/* Gone, or going: a file deleted while a reader still holds it stays listed
+ * where deletes are not POSIX ones, and answers ERROR_ACCESS_DENIED. Read
+ * right after the failing call. */
+static int
+normfs_disk_sys_gone(DWORD e)
+{
+	return normfs_disk_sys_absent(e) ||
+	    (e == ERROR_ACCESS_DENIED &&
+	     RtlGetLastNtStatus() == NORMFS_DISK_STATUS_DELETE_PENDING);
 }
 
 /* Symlinks and junctions, as lstat would see them; other reparse points,
@@ -121,11 +144,9 @@ normfs_disk_sys_dir_open(const char *path, size_t path_len, int *os_error)
 	size_t n;
 
 	*os_error = 0;
-	wide = normfs_disk_sys_wpath(path, path_len, 2u);
-	if (wide == NULL) {
-		(void)normfs_disk_sys_fail(os_error);
+	wide = normfs_disk_sys_wpath(path, path_len, 2u, os_error);
+	if (wide == NULL)
 		return NULL;
-	}
 	n = wcslen(wide);
 	if (wide[n - 1u] != L'\\')
 		wide[n++] = L'\\';
@@ -174,12 +195,17 @@ normfs_disk_sys_live_size(struct normfs_disk_sys_dir *d, const wchar_t *name,
 	memcpy(path, d->dir, d->dir_len * sizeof(wchar_t));
 	memcpy(path + d->dir_len, name, (len + 1u) * sizeof(wchar_t));
 	ok = GetFileAttributesExW(path, GetFileExInfoStandard, &data);
-	free(path);
 	if (!ok) {
-		if (normfs_disk_sys_absent(GetLastError()))
+		DWORD e = GetLastError();
+		int gone = normfs_disk_sys_gone(e);
+
+		free(path);
+		if (gone)
 			return 0;
-		return normfs_disk_sys_fail(os_error);
+		*os_error = (e > 0u && e <= 0x7FFFFFFFu) ? (int)e : ERROR_GEN_FAILURE;
+		return -1;
 	}
+	free(path);
 	*size = ((uint64_t)data.nFileSizeHigh << 32) | data.nFileSizeLow;
 	return 1;
 }
@@ -262,19 +288,22 @@ normfs_disk_sys_file_size(const char *path, size_t path_len, uint64_t *size,
 
 	*os_error = 0;
 	*size = 0u;
-	wide = normfs_disk_sys_wpath(path, path_len, 0u);
+	wide = normfs_disk_sys_wpath(path, path_len, 0u, os_error);
 	if (wide == NULL)
-		return normfs_disk_sys_fail(os_error);
+		return -1;
 	if (!GetFileAttributesExW(wide, GetFileExInfoStandard, &data)) {
 		DWORD e = GetLastError();
+		int gone = normfs_disk_sys_gone(e);
 
 		free(wide);
-		if (normfs_disk_sys_absent(e))
+		if (gone)
 			return 0;
 		*os_error = (e > 0u && e <= 0x7FFFFFFFu) ? (int)e : ERROR_GEN_FAILURE;
 		return -1;
 	}
 	if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+		/* Unreadable tag: taken as a link, which is never counted. */
+		tag = IO_REPARSE_TAG_SYMLINK;
 		find = FindFirstFileW(wide, &found);
 		if (find != INVALID_HANDLE_VALUE) {
 			tag = found.dwReserved0;
@@ -295,12 +324,13 @@ normfs_disk_sys_unlink(const char *path, size_t path_len, int *os_error)
 	wchar_t *wide;
 
 	*os_error = 0;
-	wide = normfs_disk_sys_wpath(path, path_len, 0u);
+	wide = normfs_disk_sys_wpath(path, path_len, 0u, os_error);
 	if (wide == NULL)
-		return normfs_disk_sys_fail(os_error);
+		return -1;
 	if (!DeleteFileW(wide)) {
+		(void)normfs_disk_sys_fail(os_error);
 		free(wide);
-		return normfs_disk_sys_fail(os_error);
+		return -1;
 	}
 	free(wide);
 	return 0;
