@@ -27,22 +27,35 @@ fn main() {
         println!("cargo:rerun-if-changed={}", source.display());
     }
 
-    let mut build = cc::Build::new();
+    let mut build = c_build();
     build
         .files(&sources)
         .include(&include_dir)
         .include(&uintn_include_dir)
-        .flag("-std=c99")
-        .flag("-Wall")
-        .flag("-Wextra")
-        .flag("-Werror")
-        .flag("-pedantic")
         .opt_level(3)
         .warnings(false);
 
-    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") {
+    if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
+        && !build.get_compiler().is_like_msvc()
+    {
         build.flag("-msse4.2");
     }
 
     build.compile("normfs_wal_c");
+}
+
+/// cl has its own flags; /WX holds the C to the same no-warnings bar as -Werror.
+fn c_build() -> cc::Build {
+    let mut build = cc::Build::new();
+    if build.get_compiler().is_like_msvc() {
+        build.flag("/std:c11").flag("/W4").flag("/WX");
+    } else {
+        build
+            .flag("-std=c99")
+            .flag("-Wall")
+            .flag("-Wextra")
+            .flag("-Werror")
+            .flag("-pedantic");
+    }
+    build
 }
