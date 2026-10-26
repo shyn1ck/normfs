@@ -145,7 +145,7 @@ async fn append_commits_whole_batches_and_cuts_back_on_failure() {
     match out {
         AppendOutcome::Failed { err, restored } => {
             assert!(restored);
-            assert_eq!(err.raw_os_error(), Some(libc::EIO));
+            assert_eq!(err.raw_os_error(), Some(crate::os::EIO));
         }
         AppendOutcome::Committed => panic!("committed through an injected failure"),
     }

@@ -32,8 +32,7 @@ fn main() {
         .files(&sources)
         .include(&include_dir)
         .include(&uintn_include_dir)
-        .opt_level(3)
-        .warnings(false);
+        .opt_level(3);
 
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
         && !build.get_compiler().is_like_msvc()
@@ -48,9 +47,13 @@ fn main() {
 fn c_build() -> cc::Build {
     let mut build = cc::Build::new();
     if build.get_compiler().is_like_msvc() {
-        build.flag("/std:c11").flag("/W4").flag("/WX");
+        build
+            .flag("/std:c11")
+            .warnings(true)
+            .warnings_into_errors(true);
     } else {
         build
+            .warnings(false)
             .flag("-std=c99")
             .flag("-Wall")
             .flag("-Wextra")

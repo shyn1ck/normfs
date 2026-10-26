@@ -26,7 +26,6 @@ fn main() {
         .files(&sources)
         .include(&include_dir)
         .opt_level(3)
-        .warnings(false)
         .compile("normfs_crypto_c");
 }
 
@@ -34,9 +33,13 @@ fn main() {
 fn c_build() -> cc::Build {
     let mut build = cc::Build::new();
     if build.get_compiler().is_like_msvc() {
-        build.flag("/std:c11").flag("/W4").flag("/WX");
+        build
+            .flag("/std:c11")
+            .warnings(true)
+            .warnings_into_errors(true);
     } else {
         build
+            .warnings(false)
             .flag("-std=c99")
             .flag("-Wall")
             .flag("-Wextra")
