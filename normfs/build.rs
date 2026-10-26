@@ -20,8 +20,17 @@ fn main() -> Result<()> {
     let include_dir = manifest_dir.join("c/include");
     let sources = [
         manifest_dir.join("c/src/disk_monitor.c"),
-        manifest_dir.join("c/src/disk_monitor_sys.c"),
+        manifest_dir.join(
+            if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+                "c/src/disk_monitor_sys_win.c"
+            } else {
+                "c/src/disk_monitor_sys.c"
+            },
+        ),
     ];
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=ntdll");
+    }
 
     println!("cargo:rerun-if-changed={}", include_dir.display());
     for source in &sources {
