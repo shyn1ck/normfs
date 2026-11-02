@@ -91,7 +91,7 @@ fn test_matches_prost() {
 }
 
 #[test]
-fn test_negative_enum_decodes_to_the_same_value() {
+fn test_negative_enum_matches_prost() {
     let resp = ServerResponse {
         read: Some(ReadResponse {
             result: -1,
@@ -100,9 +100,7 @@ fn test_negative_enum_decodes_to_the_same_value() {
         ..Default::default()
     };
     let out = encode_response(&resp, 0, u64::MAX).unwrap();
-    // five byte varint instead of prost's ten, the same i32 once decoded
-    assert_eq!(out.len() + 5, resp.encoded_len());
-    assert_eq!(ServerResponse::decode(&out[..]).unwrap(), resp);
+    assert_eq!(&out[..], &resp.encode_to_vec()[..]);
 }
 
 #[test]
