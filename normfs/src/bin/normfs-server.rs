@@ -197,22 +197,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = normfs::server::Server::new(tcp_addr, normfs.clone()).await?;
     log::info!("NormFS TCP server listening on {}", tcp_addr);
 
-    // Handle Ctrl+C for graceful shutdown
-    let normfs_for_shutdown = normfs.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for Ctrl+C");
-        log::info!("Received Ctrl+C, shutting down...");
-        log::info!("Closing NormFS (writing WAL)...");
-        if let Err(e) = normfs_for_shutdown.close().await {
-            log::error!("Error during NormFS close: {}", e);
-        }
-        log::info!("NormFS closed successfully");
-        std::process::exit(0);
-    });
-
-    server.run().await?;
+    // A server that stops on its own still closes NormFS, or the WAL loses what it holds.
+    let result = tokio::select! {
+        run = server.run() => run.inspect_err(|e| log::error!("TCP server stopped: {}", e)),
+        signal = tokio::signal::ctrl_c() => signal.map(|()| {
+            log::info!("Received Ctrl+C, shutting down...");
+        }),
+    };
+    // New clients are refused rather than left in the backlog while NormFS closes.
+    drop(server);
+    log::info!("Closing NormFS (writing WAL)...");
+    match normfs.close().await {
+        Ok(()) => log::info!("NormFS closed successfully"),
+        Err(e) => log::error!("Error during NormFS close: {}", e),
+    }
+    result?;
 
     Ok(())
 }
