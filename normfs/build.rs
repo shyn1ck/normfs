@@ -30,13 +30,22 @@ fn main() -> Result<()> {
     let sources = [
         manifest_dir.join("c/src/conn.c"),
         manifest_dir.join("c/src/disk_monitor.c"),
-        manifest_dir.join("c/src/disk_monitor_sys.c"),
+        manifest_dir.join(
+            if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+                "c/src/disk_monitor_sys_win.c"
+            } else {
+                "c/src/disk_monitor_sys.c"
+            },
+        ),
         manifest_dir.join("c/src/frame.c"),
         manifest_dir.join("c/src/net.c"),
         manifest_dir.join("c/src/net_sys.c"),
         manifest_dir.join("c/src/request.c"),
         manifest_dir.join("c/src/response.c"),
     ];
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=ntdll");
+    }
 
     println!("cargo:rerun-if-changed={}", include_dir.display());
     println!("cargo:rerun-if-changed={}", uintn_include_dir.display());
@@ -45,19 +54,33 @@ fn main() -> Result<()> {
         println!("cargo:rerun-if-changed={}", source.display());
     }
 
-    cc::Build::new()
+    c_build()
         .files(&sources)
         .include(&include_dir)
         .include(&uintn_include_dir)
         .include(&gremlin_dir)
-        .flag("-std=c99")
-        .flag("-Wall")
-        .flag("-Wextra")
-        .flag("-Werror")
-        .flag("-pedantic")
         .opt_level(3)
-        .warnings(false)
         .compile("normfs_c");
 
     Ok(())
+}
+
+/// cl has its own flags; /WX holds the C to the same no-warnings bar as -Werror.
+fn c_build() -> cc::Build {
+    let mut build = cc::Build::new();
+    if build.get_compiler().is_like_msvc() {
+        build
+            .flag("/std:c11")
+            .warnings(true)
+            .warnings_into_errors(true);
+    } else {
+        build
+            .warnings(false)
+            .flag("-std=c99")
+            .flag("-Wall")
+            .flag("-Wextra")
+            .flag("-Werror")
+            .flag("-pedantic");
+    }
+    build
 }
