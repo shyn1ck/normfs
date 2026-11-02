@@ -6,6 +6,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::{Accepted, SysFd};
 
+/// NORMFS_NET_SYS_ACCEPT_TRIES of the Unix accept.
+const ACCEPT_TRIES: u32 = 64;
+
 unsafe extern "C" {
     fn normfs_net_sys_shutdown_write(fd: SysFd);
 }
@@ -25,16 +28,20 @@ impl Listener {
     }
 
     pub(crate) async fn accept(&self) -> io::Result<Accepted> {
+        let mut failed = 0;
         let (stream, peer) = loop {
             match self.0.accept().await {
-                // The connection was reset or aborted while queued; accept took it off.
+                // Reset or aborted while queued; accept took it off. Readiness stays set, so
+                // this yields and gives up after as many as the Unix accept takes in a row.
                 Err(e)
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
-                    ) =>
+                    if failed < ACCEPT_TRIES
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                        ) =>
                 {
-                    continue;
+                    failed += 1;
+                    tokio::task::consume_budget().await;
                 }
                 other => break other?,
             }

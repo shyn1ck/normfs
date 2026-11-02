@@ -387,7 +387,7 @@ impl ClientHandler {
                         state.write();
                     }
                     Err(e) => {
-                        error!("Error reading message size (client_addr: {}, error: {})", addr, e);
+                        log_io_error("Error reading message size", addr, &e);
                         state.release();
                     }
                 },
@@ -399,7 +399,7 @@ impl ClientHandler {
                         }
                     }
                     Err(e) => {
-                        error!("Error writing response (client_addr: {}, error: {})", addr, e);
+                        log_io_error("Error writing response", addr, &e);
                         state.release();
                     }
                 },
@@ -573,11 +573,7 @@ impl Driver {
                     log_read_closed(self.addr, e.status, e.os_error, e.value, e.in_payload != 0);
                 }
                 EV_WRITE_CLOSED => {
-                    error!(
-                        "Error writing response (client_addr: {}, error: {})",
-                        self.addr,
-                        os_error(e.os_error)
-                    );
+                    log_io_error("Error writing response", self.addr, &os_error(e.os_error));
                     self.closed.store(true, Ordering::Release);
                     self.write_closed = true;
                     self.requests = None;
@@ -595,6 +591,26 @@ impl Driver {
     }
 }
 
+/// Windows closes a socket with unread data by reset, which is how most of its clients
+/// disconnect, and a reply still in flight then fails the same way.
+fn reset(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
+fn log_io_error(what: &str, addr: SocketAddr, e: &std::io::Error) {
+    if reset(e) {
+        debug!(
+            "Client disconnected (reset) (client_addr: {}, during: {})",
+            addr, what
+        );
+    } else {
+        error!("{} (client_addr: {}, error: {})", what, addr, e);
+    }
+}
+
 fn log_read_closed(addr: SocketAddr, status: c_int, os_err: c_int, size: u64, in_payload: bool) {
     match (status, in_payload) {
         (NET_OK, _) => {}
@@ -607,9 +623,7 @@ fn log_read_closed(addr: SocketAddr, status: c_int, os_err: c_int, size: u64, in
             "Message size exceeds maximum (client_addr: {}, message_size: {}, max_size: {})",
             addr, size, FRAME_MAX_PAYLOAD
         ),
-        // Windows closes a socket with unread data by reset, which is how
-        // most of its clients disconnect.
-        (NET_ERR_IO, false) if os_error(os_err).kind() == std::io::ErrorKind::ConnectionReset => {
+        (NET_ERR_IO, false) if reset(&os_error(os_err)) => {
             debug!("Client disconnected (reset) (client_addr: {})", addr)
         }
         (NET_ERR_IO, false) => error!(
