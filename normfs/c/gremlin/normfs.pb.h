@@ -1272,7 +1272,7 @@ normfs_Offset_cached_size(const normfs_Offset *m)
         1 + varint_size(normfs_Id_tsize((normfs_Id *)m->id)) + normfs_Id_tsize((normfs_Id *)m->id) : 0;
 
     logic integer normfs_Offset_type_size{L}(normfs_Offset *m) =
-      m->type != 0 ? 1 + varint_size((uint64_t)(int64_t)m->type) : 0;
+      m->type != 0 ? 1 + varint_size((uint64_t)(int64_t)(int32_t)m->type) : 0;
 
     logic integer normfs_Offset_tsize{L}(normfs_Offset *m) =
       normfs_Offset_id_size(m) +
@@ -1375,7 +1375,7 @@ normfs_Offset_size(const normfs_Offset *m)
 	/*@ ghost _A1: ; */
 	if (m->type != 0) {
 		s += 1
-		   + gremlin_varint_size((uint64_t)(int64_t)m->type);
+		   + gremlin_varint_size((uint64_t)(int64_t)(int32_t)m->type);
 	}
 	/*@ assert s == \at(s, _A1) + \at(normfs_Offset_type_size(m), Pre); */
 	/*@ ghost _A2: ; */
@@ -1430,7 +1430,7 @@ normfs_Offset_encode_at(const normfs_Offset *m, uint8_t * __restrict__ _buf, siz
 	/*@ ghost _A1: ; */
 	if (m->type != 0) {
 		_off = gremlin_varint32_encode_at(_buf, _off, 16u);
-		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)m->type);
+		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)(int32_t)m->type);
 	}
 	/*@ assert _off == \at(_off, _A1) + \at(normfs_Offset_type_size(m), Pre); */
 	/*@ ghost _A2: ; */
@@ -1814,7 +1814,7 @@ normfs_ReadRequest_size(const normfs_ReadRequest *m)
 	/*@ assert s == \at(s, _A2) + \at(normfs_ReadRequest_step_size(m), Pre); */
 	/*@ ghost _A3: ; */
 	if (m->accept_encodings_count == 1) {
-		s += 1 + gremlin_varint_size((uint64_t)(int64_t)m->accept_encodings[0]);
+		s += 1 + gremlin_varint_size((uint64_t)(int64_t)(int32_t)m->accept_encodings[0]);
 	} else if (m->accept_encodings_count > 1) {
 		size_t _payload = 0;
 		/*@ loop invariant 0 <= _i <= m->accept_encodings_count;
@@ -1823,7 +1823,7 @@ normfs_ReadRequest_size(const normfs_ReadRequest *m)
 		    loop variant m->accept_encodings_count - _i;
 		*/
 		for (size_t _i = 0; _i < m->accept_encodings_count; _i++) {
-			_payload += gremlin_varint_size((uint64_t)(int64_t)m->accept_encodings[_i]);
+			_payload += gremlin_varint_size((uint64_t)(int64_t)(int32_t)m->accept_encodings[_i]);
 		}
 		s += 1 + gremlin_varint_size(_payload) + _payload;
 	}
@@ -1936,7 +1936,7 @@ normfs_ReadRequest_encode_at(const normfs_ReadRequest *m, uint8_t * __restrict__
 	/*@ assert _off + \at(normfs_ReadRequest_accept_encodings_size(m), Pre) <= \at(_off, Pre) + \at(m->_size, Pre); */
 	if (m->accept_encodings_count == 1) {
 		_off = gremlin_varint32_encode_at(_buf, _off, 32u);
-		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)m->accept_encodings[0]);
+		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)(int32_t)m->accept_encodings[0]);
 	} else if (m->accept_encodings_count > 1) {
 		size_t _payload = 0;
 		/*@ loop invariant 0 <= _i <= m->accept_encodings_count;
@@ -1945,7 +1945,7 @@ normfs_ReadRequest_encode_at(const normfs_ReadRequest *m, uint8_t * __restrict__
 		    loop variant m->accept_encodings_count - _i;
 		*/
 		for (size_t _i = 0; _i < m->accept_encodings_count; _i++) {
-			_payload += gremlin_varint_size((uint64_t)(int64_t)m->accept_encodings[_i]);
+			_payload += gremlin_varint_size((uint64_t)(int64_t)(int32_t)m->accept_encodings[_i]);
 		}
 		_off = gremlin_varint32_encode_at(_buf, _off, 34u);
 		_off = gremlin_varint_encode_at(_buf, _off, _payload);
@@ -1959,7 +1959,7 @@ normfs_ReadRequest_encode_at(const normfs_ReadRequest *m, uint8_t * __restrict__
 			/*@ assert \forall integer k; k == _i ==>
 			      \at(normfs_ReadRequest_accept_encodings_sum(m, k + 1), Pre) == \at(normfs_ReadRequest_accept_encodings_sum(m, k), Pre) + \at(varint_size(m->accept_encodings[k] < 0 ? m->accept_encodings[k] + 18446744073709551616 : m->accept_encodings[k]), Pre) &&
 			      \at(normfs_ReadRequest_accept_encodings_sum(m, k + 1), Pre) <= \at(normfs_ReadRequest_accept_encodings_sum(m, m->accept_encodings_count), Pre); */
-		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)m->accept_encodings[_i]);
+		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)(int32_t)m->accept_encodings[_i]);
 		}
 	}
 	/*@ assert _off == \at(_off, _A3) + \at(normfs_ReadRequest_accept_encodings_size(m), Pre); */
@@ -4064,7 +4064,7 @@ normfs_WriteResponse_cached_size(const normfs_WriteResponse *m)
       m->write_id != 0 ? 1 + varint_size(m->write_id) : 0;
 
     logic integer normfs_WriteResponse_result_size{L}(normfs_WriteResponse *m) =
-      m->result != 0 ? 1 + varint_size((uint64_t)(int64_t)m->result) : 0;
+      m->result != 0 ? 1 + varint_size((uint64_t)(int64_t)(int32_t)m->result) : 0;
 
     logic integer normfs_WriteResponse_ids_size{L}(normfs_WriteResponse *m) =
       normfs_WriteResponse_ids_sum(m, m->ids_count);
@@ -4204,7 +4204,7 @@ normfs_WriteResponse_size(const normfs_WriteResponse *m)
 	/*@ ghost _A1: ; */
 	if (m->result != 0) {
 		s += 1
-		   + gremlin_varint_size((uint64_t)(int64_t)m->result);
+		   + gremlin_varint_size((uint64_t)(int64_t)(int32_t)m->result);
 	}
 	/*@ assert s == \at(s, _A1) + \at(normfs_WriteResponse_result_size(m), Pre); */
 	/*@ ghost _A2: ; */
@@ -4278,7 +4278,7 @@ normfs_WriteResponse_encode_at(const normfs_WriteResponse *m, uint8_t * __restri
 	/*@ ghost _A1: ; */
 	if (m->result != 0) {
 		_off = gremlin_varint32_encode_at(_buf, _off, 16u);
-		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)m->result);
+		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)(int32_t)m->result);
 	}
 	/*@ assert _off == \at(_off, _A1) + \at(normfs_WriteResponse_result_size(m), Pre); */
 	/*@ ghost _A2: ; */
@@ -4610,7 +4610,7 @@ normfs_ReadResponse_cached_size(const normfs_ReadResponse *m)
       m->read_id != 0 ? 1 + varint_size(m->read_id) : 0;
 
     logic integer normfs_ReadResponse_result_size{L}(normfs_ReadResponse *m) =
-      m->result != 0 ? 1 + varint_size((uint64_t)(int64_t)m->result) : 0;
+      m->result != 0 ? 1 + varint_size((uint64_t)(int64_t)(int32_t)m->result) : 0;
 
     logic integer normfs_ReadResponse_id_size{L}(normfs_ReadResponse *m) =
       m->id != \null ?
@@ -4620,10 +4620,10 @@ normfs_ReadResponse_cached_size(const normfs_ReadResponse *m)
       m->data.len > 0 ? 1 + varint_size(m->data.len) + m->data.len : 0;
 
     logic integer normfs_ReadResponse_data_source_size{L}(normfs_ReadResponse *m) =
-      m->data_source != 0 ? 1 + varint_size((uint64_t)(int64_t)m->data_source) : 0;
+      m->data_source != 0 ? 1 + varint_size((uint64_t)(int64_t)(int32_t)m->data_source) : 0;
 
     logic integer normfs_ReadResponse_encoding_size{L}(normfs_ReadResponse *m) =
-      m->encoding != 0 ? 1 + varint_size((uint64_t)(int64_t)m->encoding) : 0;
+      m->encoding != 0 ? 1 + varint_size((uint64_t)(int64_t)(int32_t)m->encoding) : 0;
 
     logic integer normfs_ReadResponse_tsize{L}(normfs_ReadResponse *m) =
       normfs_ReadResponse_read_id_size(m) +
@@ -4738,7 +4738,7 @@ normfs_ReadResponse_size(const normfs_ReadResponse *m)
 	/*@ ghost _A1: ; */
 	if (m->result != 0) {
 		s += 1
-		   + gremlin_varint_size((uint64_t)(int64_t)m->result);
+		   + gremlin_varint_size((uint64_t)(int64_t)(int32_t)m->result);
 	}
 	/*@ assert s == \at(s, _A1) + \at(normfs_ReadResponse_result_size(m), Pre); */
 	/*@ ghost _A2: ; */
@@ -4778,13 +4778,13 @@ normfs_ReadResponse_size(const normfs_ReadResponse *m)
 	/*@ ghost _A4: ; */
 	if (m->data_source != 0) {
 		s += 1
-		   + gremlin_varint_size((uint64_t)(int64_t)m->data_source);
+		   + gremlin_varint_size((uint64_t)(int64_t)(int32_t)m->data_source);
 	}
 	/*@ assert s == \at(s, _A4) + \at(normfs_ReadResponse_data_source_size(m), Pre); */
 	/*@ ghost _A5: ; */
 	if (m->encoding != 0) {
 		s += 1
-		   + gremlin_varint_size((uint64_t)(int64_t)m->encoding);
+		   + gremlin_varint_size((uint64_t)(int64_t)(int32_t)m->encoding);
 	}
 	/*@ assert s == \at(s, _A5) + \at(normfs_ReadResponse_encoding_size(m), Pre); */
 	/*@ ghost _A6: ; */
@@ -4829,7 +4829,7 @@ normfs_ReadResponse_encode_at(const normfs_ReadResponse *m, uint8_t * __restrict
 	/*@ ghost _A1: ; */
 	if (m->result != 0) {
 		_off = gremlin_varint32_encode_at(_buf, _off, 16u);
-		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)m->result);
+		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)(int32_t)m->result);
 	}
 	/*@ assert _off == \at(_off, _A1) + \at(normfs_ReadResponse_result_size(m), Pre); */
 	/*@ ghost _A2: ; */
@@ -4860,13 +4860,13 @@ normfs_ReadResponse_encode_at(const normfs_ReadResponse *m, uint8_t * __restrict
 	/*@ ghost _A4: ; */
 	if (m->data_source != 0) {
 		_off = gremlin_varint32_encode_at(_buf, _off, 96u);
-		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)m->data_source);
+		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)(int32_t)m->data_source);
 	}
 	/*@ assert _off == \at(_off, _A4) + \at(normfs_ReadResponse_data_source_size(m), Pre); */
 	/*@ ghost _A5: ; */
 	if (m->encoding != 0) {
 		_off = gremlin_varint32_encode_at(_buf, _off, 104u);
-		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)m->encoding);
+		_off = gremlin_varint_encode_at(_buf, _off, (uint64_t)(int64_t)(int32_t)m->encoding);
 	}
 	/*@ assert _off == \at(_off, _A5) + \at(normfs_ReadResponse_encoding_size(m), Pre); */
 	/*@ ghost _A6: ; */
