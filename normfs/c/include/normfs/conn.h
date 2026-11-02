@@ -14,6 +14,9 @@
 
 /* How long the read side waits for a header, or for the rest of a payload. */
 #define NORMFS_CONN_IDLE_MS 10000
+/* Longer than the read wait: on Linux a socket is writable only once a slow
+ * reader drains it below TCP_NOTSENT_LOWAT. */
+#define NORMFS_CONN_WRITE_IDLE_MS 60000
 
 /* A payload buffer starts this big and doubles as bytes arrive, so a header
  * alone cannot claim the memory it announces. */
@@ -42,7 +45,8 @@ enum normfs_conn_event_kind {
 };
 
 /* Why the read side closed, beside the net statuses EOF, ERR_IO and
- * ERR_TOO_LARGE; NORMFS_NET_OK when Rust stopped it. */
+ * ERR_TOO_LARGE; NORMFS_NET_OK when Rust stopped it. The write side closes
+ * with ERR_IO, or with this after sending nothing for NORMFS_CONN_WRITE_IDLE_MS. */
 #define NORMFS_CONN_TIMEOUT 100
 
 /*
@@ -104,6 +108,7 @@ struct normfs_conn_queue {
 struct normfs_conn_tx {
 	struct normfs_conn_queue q[2];
 	uint64_t token;
+	int64_t wdeadline_ms;
 	size_t woff;
 	int fd;
 	int8_t wclass;
@@ -122,7 +127,8 @@ struct normfs_conn_tx {
       (t->wclass == -1 ==> t->woff == 0) &&
       (t->wclass != -1 ==> t->write_open == 1 && t->q[t->wclass].count > 0 &&
          t->woff <= t->q[t->wclass].f[0].len) &&
-      (t->write_open == 0 ==> t->q[0].count == 0 && t->q[1].count == 0);
+      (t->write_open == 0 ==> t->q[0].count == 0 && t->q[1].count == 0) &&
+      (t->q[0].count + t->q[1].count > 0 ==> t->wdeadline_ms >= NORMFS_CONN_WRITE_IDLE_MS);
 
     predicate normfs_conn_rx_flags_ok{L}(struct normfs_conn_rx *r) =
       (r->reading == 0 || r->reading == 1) &&
@@ -174,8 +180,10 @@ int64_t normfs_conn_deadline(const struct normfs_conn_rx *r);
 
 void normfs_conn_tx_init(struct normfs_conn_tx *t, int fd, uint64_t token);
 int normfs_conn_submit(struct normfs_conn_tx *t, struct normfs_conn_events *out, int cls,
-    const uint8_t *buf, size_t len, uint64_t cookie);
-int normfs_conn_write(struct normfs_conn_tx *t, struct normfs_conn_events *out);
+    const uint8_t *buf, size_t len, uint64_t cookie, int64_t now);
+int normfs_conn_write(struct normfs_conn_tx *t, struct normfs_conn_events *out, int64_t now);
+void normfs_conn_tx_tick(struct normfs_conn_tx *t, struct normfs_conn_events *out, int64_t now);
+int64_t normfs_conn_tx_deadline(const struct normfs_conn_tx *t);
 int normfs_conn_tx_interest(const struct normfs_conn_tx *t);
 int normfs_conn_tx_drained(const struct normfs_conn_tx *t);
 size_t normfs_conn_rx_size(void);

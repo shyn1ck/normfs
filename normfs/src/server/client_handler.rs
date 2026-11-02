@@ -83,8 +83,11 @@ unsafe extern "C" {
         buf: *const u8,
         len: usize,
         cookie: u64,
+        now: i64,
     ) -> c_int;
-    fn normfs_conn_write(t: *mut u8, out: *mut CEvents) -> c_int;
+    fn normfs_conn_write(t: *mut u8, out: *mut CEvents, now: i64) -> c_int;
+    fn normfs_conn_tx_tick(t: *mut u8, out: *mut CEvents, now: i64);
+    fn normfs_conn_tx_deadline(t: *const u8) -> i64;
     fn normfs_conn_tx_interest(t: *const u8) -> c_int;
     fn normfs_conn_tx_drained(t: *const u8) -> c_int;
 }
@@ -435,12 +438,19 @@ impl Driver {
     fn wants(&mut self) -> (c_int, i64) {
         let (rx, tx) = (self.sides.rx(), self.sides.tx());
         // SAFETY: rx and tx are the initialised sides.
-        unsafe {
+        let (want, rd, wd) = unsafe {
             (
                 normfs_conn_rx_interest(rx) | normfs_conn_tx_interest(tx),
                 normfs_conn_deadline(rx),
+                normfs_conn_tx_deadline(tx),
             )
-        }
+        };
+        // -1 is no deadline.
+        let deadline = match (rd, wd) {
+            (-1, d) | (d, -1) => d,
+            (r, w) => r.min(w),
+        };
+        (want, deadline)
     }
 
     fn drained(&mut self) -> bool {
@@ -465,10 +475,11 @@ impl Driver {
 
     /// Writes what the socket takes; true once it would block.
     fn write(&mut self) -> bool {
+        let now = self.now();
         let tx = self.sides.tx();
         let mut out = self.sides.out();
         // SAFETY: tx is the initialised write side and out has room for every queued frame.
-        let blocked = unsafe { normfs_conn_write(tx, &mut out) } != 0;
+        let blocked = unsafe { normfs_conn_write(tx, &mut out, now) } != 0;
         self.handle(out.n);
         blocked
     }
@@ -479,6 +490,14 @@ impl Driver {
         let mut out = self.sides.out();
         // SAFETY: as in read.
         unsafe { normfs_conn_tick(rx, &mut out, now) };
+        self.handle(out.n);
+        // On Linux readiness waits for the unsent bytes to fall well below
+        // TCP_NOTSENT_LOWAT; a write now still sees a reader that drains slowly.
+        self.write();
+        let tx = self.sides.tx();
+        let mut out = self.sides.out();
+        // SAFETY: as in write.
+        unsafe { normfs_conn_tx_tick(tx, &mut out, now) };
         self.handle(out.n);
     }
 
@@ -501,6 +520,7 @@ impl Driver {
                 frame,
                 permit,
             } => {
+                let now = self.now();
                 let cookie = self.next_cookie;
                 self.next_cookie += 1;
                 let (ptr, len) = (frame.as_ptr(), frame.len());
@@ -509,7 +529,7 @@ impl Driver {
                 let mut out = self.sides.out();
                 // SAFETY: the frame stays in self.frames, unmoved, until its SENT event;
                 // the class semaphore keeps the queue below its sixteen.
-                if unsafe { normfs_conn_submit(tx, &mut out, class, ptr, len, cookie) } != 0 {
+                if unsafe { normfs_conn_submit(tx, &mut out, class, ptr, len, cookie, now) } != 0 {
                     error!("Response queue full (client_addr: {})", self.addr);
                     self.frames.remove(&cookie);
                     self.closed.store(true, Ordering::Release);
@@ -574,11 +594,15 @@ impl Driver {
                     log_read_closed(self.addr, e.status, e.os_error, e.value, e.in_payload != 0);
                 }
                 EV_WRITE_CLOSED => {
-                    error!(
-                        "Error writing response (client_addr: {}, error: {})",
-                        self.addr,
-                        os_error(e.os_error)
-                    );
+                    if e.status == CONN_TIMEOUT {
+                        info!("Client stopped reading (client_addr: {})", self.addr);
+                    } else {
+                        error!(
+                            "Error writing response (client_addr: {}, error: {})",
+                            self.addr,
+                            os_error(e.os_error)
+                        );
+                    }
                     self.closed.store(true, Ordering::Release);
                     self.write_closed = true;
                     self.requests = None;

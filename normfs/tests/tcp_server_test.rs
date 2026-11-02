@@ -312,3 +312,58 @@ async fn replies_go_out_while_the_client_keeps_sending() {
     }
     keepalives.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_stops_reading_is_closed() {
+    let dir = TempDir::new().unwrap();
+    let fs = memory_fs(&dir, QueueSettings::default()).await;
+    let queue = fs.resolve("bulk");
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    let server = Server::new("127.0.0.1:0".parse().unwrap(), fs.clone())
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(async move { server.run().await });
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut stream = socket.connect(addr).await.unwrap();
+
+    let follow = ClientRequest {
+        read: Some(ReadRequest {
+            read_id: 1,
+            queue_id: "bulk".into(),
+            step: 1,
+            offset: None,
+            limit: 0,
+            accept_encodings: Vec::new(),
+        }),
+        ..Default::default()
+    };
+    stream.write_all(&message(&follow)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // More than the kernel buffers on either side hold.
+    for i in 0..512u32 {
+        fs.enqueue(&queue, Bytes::from(vec![i as u8; 16 * 1024]))
+            .await
+            .unwrap();
+    }
+    let ping = message(&ClientRequest {
+        ping: Some(PingRequest {
+            sequence: 1,
+            client_timestamp_ns: 0,
+        }),
+        ..Default::default()
+    });
+
+    // Never reads; keeps sending, so only the write side can see it is gone.
+    let closed = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            if stream.write_all(&ping).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the connection stayed open");
+}

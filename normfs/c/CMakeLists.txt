@@ -182,6 +182,8 @@ if(FRAMAC)
         normfs_conn_write
         normfs_conn_tx_interest
         normfs_conn_tx_drained
+        normfs_conn_tx_tick
+        normfs_conn_tx_deadline
         normfs_conn_rx_size
         normfs_conn_tx_size
         normfs_conn_events_room

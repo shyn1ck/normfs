@@ -13,7 +13,7 @@ typedef char normfs_conn_event_size_ok[
 #define NORMFS_CONN_TX_OK(t) \
 	normfs_conn_tx_flags_ok(t) && normfs_conn_queue_ok(&(t)->q[0], t) && \
 	normfs_conn_queue_ok(&(t)->q[1], t)
-#define NORMFS_CONN_NOW_OK(now) 0 <= now <= 0x7fffffffffffffff - NORMFS_CONN_IDLE_MS
+#define NORMFS_CONN_NOW_OK(now) 0 <= now <= 0x7fffffffffffffff - NORMFS_CONN_WRITE_IDLE_MS
 
 /*@ predicate normfs_conn_room(struct normfs_conn_events *out, integer k) =
       out->cap - out->n >= k;
@@ -354,6 +354,7 @@ normfs_conn_tx_init(struct normfs_conn_tx *t, int fd, uint64_t token)
 	t->q[0].count = 0u;
 	t->q[1].count = 0u;
 	t->token = token;
+	t->wdeadline_ms = 0;
 	t->woff = 0u;
 	t->fd = fd;
 	t->wclass = -1;
@@ -369,7 +370,14 @@ normfs_conn_tx_init(struct normfs_conn_tx *t, int fd, uint64_t token)
     requires cls == NORMFS_CONN_REPLY || cls == NORMFS_CONN_READ;
     requires len >= 1 && \valid_read(buf + (0 .. len - 1));
     requires \separated(t, buf + (0 .. len - 1));
-    assigns t->q[cls], out->n, out->ev[out->n];
+    requires NORMFS_CONN_NOW_OK(now);
+    assigns t->q[cls], t->wdeadline_ms, out->n, out->ev[out->n];
+    ensures \result == 0 && t->write_open == 1 &&
+              \old(t->q[0].count) + \old(t->q[1].count) == 0 ==>
+              t->wdeadline_ms == now + NORMFS_CONN_WRITE_IDLE_MS;
+    ensures !(\result == 0 && t->write_open == 1 &&
+              \old(t->q[0].count) + \old(t->q[1].count) == 0) ==>
+              t->wdeadline_ms == \old(t->wdeadline_ms);
     ensures NORMFS_CONN_TX_OK(t);
     ensures \result == 0 || \result == -1;
     ensures \result == -1 <==> t->write_open == 1 &&
@@ -391,7 +399,7 @@ normfs_conn_tx_init(struct normfs_conn_tx *t, int fd, uint64_t token)
 */
 int
 normfs_conn_submit(struct normfs_conn_tx *t, struct normfs_conn_events *out, int cls,
-    const uint8_t *buf, size_t len, uint64_t cookie)
+    const uint8_t *buf, size_t len, uint64_t cookie, int64_t now)
 {
 	struct normfs_conn_queue *q = &t->q[cls];
 
@@ -401,6 +409,9 @@ normfs_conn_submit(struct normfs_conn_tx *t, struct normfs_conn_events *out, int
 	}
 	if (q->count == NORMFS_CONN_QUEUE)
 		return -1;
+	/* The write side has until then to send a first byte of it. */
+	if (t->q[0].count + t->q[1].count == 0u)
+		t->wdeadline_ms = now + NORMFS_CONN_WRITE_IDLE_MS;
 	q->f[q->count].buf = buf;
 	q->f[q->count].len = len;
 	q->f[q->count].cookie = cookie;
@@ -425,6 +436,7 @@ normfs_conn_submit(struct normfs_conn_tx *t, struct normfs_conn_events *out, int
               out->ev[\old(out->n) + \old(t->q[0].count) + j].value ==
                 \old(t->q[1].f[j].cookie);
     ensures out->ev[out->n - 1].kind == NORMFS_CONN_EV_WRITE_CLOSED;
+    ensures out->ev[out->n - 1].status == status;
     ensures \forall integer k; \old(out->n) <= k < out->n ==> out->ev[k].conn == t->token;
     ensures \forall integer k; 0 <= k < \old(out->n) ==>
               out->ev[k].kind == \old(out->ev[k].kind) &&
@@ -432,7 +444,8 @@ normfs_conn_submit(struct normfs_conn_tx *t, struct normfs_conn_events *out, int
               out->ev[k].conn == \old(out->ev[k].conn);
 */
 static void
-normfs_conn_close_write(struct normfs_conn_tx *t, struct normfs_conn_events *out, int os_error)
+normfs_conn_close_write(struct normfs_conn_tx *t, struct normfs_conn_events *out, int status,
+    int os_error)
 {
 	uint32_t i;
 	int k;
@@ -493,7 +506,7 @@ normfs_conn_close_write(struct normfs_conn_tx *t, struct normfs_conn_events *out
 		t->q[k].count = 0u;
 	}
 	t->write_open = 0;
-	normfs_conn_emit(out, t->token, NORMFS_CONN_EV_WRITE_CLOSED, 0u, (uint8_t *)0, 0,
+	normfs_conn_emit(out, t->token, NORMFS_CONN_EV_WRITE_CLOSED, 0u, (uint8_t *)0, status,
 	    os_error, 0);
 }
 
@@ -553,9 +566,15 @@ normfs_conn_pick(const struct normfs_conn_tx *t)
 /*@ requires \valid(t) && NORMFS_CONN_TX_OK(t);
     requires \valid(out) && normfs_conn_tx_events_ok(out, t);
     requires normfs_conn_room(out, 2 * NORMFS_CONN_QUEUE + 1);
-    assigns t->q[0 .. 1], t->wclass, t->woff, t->write_open,
+    requires NORMFS_CONN_NOW_OK(now);
+    assigns t->q[0 .. 1], t->wclass, t->woff, t->write_open, t->wdeadline_ms,
             out->n, out->ev[0 .. out->cap - 1], normfs_net_sys_world;
     ensures NORMFS_CONN_TX_OK(t);
+    ensures net_opos(t->fd) >= \old(net_opos(t->fd));
+    ensures net_opos(t->fd) > \old(net_opos(t->fd)) ==>
+              t->wdeadline_ms == now + NORMFS_CONN_WRITE_IDLE_MS;
+    ensures net_opos(t->fd) == \old(net_opos(t->fd)) ==>
+              t->wdeadline_ms == \old(t->wdeadline_ms);
     ensures \old(out->n) <= out->n <= \old(out->n) + 2 * NORMFS_CONN_QUEUE + 1;
     ensures t->write_open <= \old(t->write_open);
     ensures \forall integer g; net_pos(g) == \old(net_pos(g));
@@ -567,10 +586,11 @@ normfs_conn_pick(const struct normfs_conn_tx *t)
     ensures \result == 0 || \result == 1;
 */
 int
-normfs_conn_write(struct normfs_conn_tx *t, struct normfs_conn_events *out)
+normfs_conn_write(struct normfs_conn_tx *t, struct normfs_conn_events *out, int64_t now)
 {
 	struct normfs_net_result res;
 	struct normfs_conn_queue *q;
+	size_t woff;
 	/*@ ghost int sent = 0; */
 
 	/*@ loop invariant NORMFS_CONN_TX_OK(t);
@@ -583,13 +603,18 @@ normfs_conn_write(struct normfs_conn_tx *t, struct normfs_conn_events *out)
 	    loop invariant t->write_open == \at(t->write_open, Pre);
 	    loop invariant \forall integer g; net_pos(g) == \at(net_pos(g), Pre);
 	    loop invariant t->token == \at(t->token, Pre);
+	    loop invariant net_opos(t->fd) >= \at(net_opos(t->fd), Pre);
+	    loop invariant net_opos(t->fd) > \at(net_opos(t->fd), Pre) ==>
+	                     t->wdeadline_ms == now + NORMFS_CONN_WRITE_IDLE_MS;
+	    loop invariant net_opos(t->fd) == \at(net_opos(t->fd), Pre) ==>
+	                     t->wdeadline_ms == \at(t->wdeadline_ms, Pre);
 	    loop invariant t->q[0].count <= \at(t->q[0].count, Pre);
 	    loop invariant t->q[1].count <= \at(t->q[1].count, Pre);
 	    loop invariant \forall integer k; \at(out->n, Pre) <= k < out->n ==>
 	                     out->ev[k].conn == t->token;
 	    loop invariant \forall integer k; \at(out->n, Pre) <= k < out->n ==>
 	                     out->ev[k].kind == NORMFS_CONN_EV_SENT;
-	    loop assigns sent, res, q, t->q[0 .. 1], t->wclass, t->woff,
+	    loop assigns sent, res, q, woff, t->q[0 .. 1], t->wclass, t->woff, t->wdeadline_ms,
 	                 normfs_net_sys_world, out->n, \at(out->ev, Pre)[0 .. \at(out->cap, Pre) - 1];
 	    loop variant t->q[0].count + t->q[1].count;
 	*/
@@ -600,13 +625,17 @@ normfs_conn_write(struct normfs_conn_tx *t, struct normfs_conn_events *out)
 				return 0;
 		}
 		q = &t->q[t->wclass];
+		woff = t->woff;
 		res = normfs_net_write(t->fd, q->f[0].buf, q->f[0].len, &t->woff);
+		/* Any byte out restarts the wait for the next. */
+		if (t->woff != woff)
+			t->wdeadline_ms = now + NORMFS_CONN_WRITE_IDLE_MS;
 		if (res.status == NORMFS_NET_WOULD_BLOCK)
 			return 1;
 		if (res.status == NORMFS_NET_YIELD)
 			return 0;
 		if (res.status != NORMFS_NET_OK) {
-			normfs_conn_close_write(t, out, res.os_error);
+			normfs_conn_close_write(t, out, NORMFS_NET_ERR_IO, res.os_error);
 			return 0;
 		}
 		normfs_conn_emit(out, t->token, NORMFS_CONN_EV_SENT, q->f[0].cookie,
@@ -641,6 +670,49 @@ int
 normfs_conn_tx_drained(const struct normfs_conn_tx *t)
 {
 	return !t->write_open || t->q[0].count + t->q[1].count == 0u;
+}
+
+/* Closes the write side once queued frames sent nothing for NORMFS_CONN_WRITE_IDLE_MS:
+ * a peer that stops reading would otherwise hold them, and its requests, for good. */
+/*@ requires \valid(t) && NORMFS_CONN_TX_OK(t);
+    requires \valid(out) && normfs_conn_tx_events_ok(out, t);
+    requires normfs_conn_room(out, 2 * NORMFS_CONN_QUEUE + 1);
+    assigns t->q[0].count, t->q[1].count, t->wclass, t->woff, t->write_open,
+            out->n, out->ev[0 .. out->cap - 1];
+    ensures NORMFS_CONN_TX_OK(t);
+    ensures out->n != \old(out->n) <==>
+              \old(t->write_open) == 1 && \old(t->q[0].count) + \old(t->q[1].count) > 0 &&
+              now >= t->wdeadline_ms;
+    ensures out->n != \old(out->n) ==>
+              t->write_open == 0 &&
+              out->n == \old(out->n) + \old(t->q[0].count) + \old(t->q[1].count) + 1 &&
+              out->ev[out->n - 1].kind == NORMFS_CONN_EV_WRITE_CLOSED &&
+              out->ev[out->n - 1].status == NORMFS_CONN_TIMEOUT;
+    ensures \forall integer k; \old(out->n) <= k < out->n ==> out->ev[k].conn == t->token;
+    ensures \forall integer k; \old(out->n) <= k < out->n ==>
+              out->ev[k].kind == NORMFS_CONN_EV_SENT ||
+              out->ev[k].kind == NORMFS_CONN_EV_WRITE_CLOSED;
+*/
+void
+normfs_conn_tx_tick(struct normfs_conn_tx *t, struct normfs_conn_events *out, int64_t now)
+{
+	if (t->write_open && t->q[0].count + t->q[1].count > 0u && now >= t->wdeadline_ms)
+		normfs_conn_close_write(t, out, NORMFS_CONN_TIMEOUT, 0);
+}
+
+/* When the write side times out, or -1 while it has nothing to send. */
+/*@ requires \valid_read(t) && NORMFS_CONN_TX_OK(t);
+    assigns \nothing;
+    ensures t->write_open == 1 && t->q[0].count + t->q[1].count > 0 ==>
+              \result == t->wdeadline_ms;
+    ensures !(t->write_open == 1 && t->q[0].count + t->q[1].count > 0) ==> \result == -1;
+*/
+int64_t
+normfs_conn_tx_deadline(const struct normfs_conn_tx *t)
+{
+	if (t->write_open && t->q[0].count + t->q[1].count > 0u)
+		return t->wdeadline_ms;
+	return -1;
 }
 
 /* Rust allocates the two sides, so it asks for their sizes. */
