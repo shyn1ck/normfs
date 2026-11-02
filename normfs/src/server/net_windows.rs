@@ -39,7 +39,7 @@ impl Listener {
                 other => break other?,
             }
         };
-        // Windows has no TCP_NOTSENT_LOWAT, as macOS on dev has no limit either.
+        // Windows has no TCP_NOTSENT_LOWAT; like macOS, it runs without the unsent limit.
         let nodelay_error = stream.set_nodelay(true).err();
         Ok(Accepted {
             conn: Conn(stream),
