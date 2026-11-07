@@ -15,6 +15,7 @@ mod memory_pointers;
 #[cfg(test)]
 mod memory_pointers_test;
 mod offload;
+mod queue_name;
 pub(crate) mod reader_fsm;
 mod system;
 
@@ -131,6 +132,7 @@ pub enum Error {
     /// The queue is NormFS's own ([`SYSTEM_QUEUE`]): it can be read, but
     /// only NormFS writes or closes it.
     ReservedQueue,
+    BadQueueName(String),
     /// `max_memory_usage` cannot hold the two pages a single queue needs to
     /// work. Refused at construction rather than rounded up: rounding up would
     /// mean the process quietly using more memory than it was configured for.
@@ -177,6 +179,9 @@ impl std::fmt::Display for Error {
             Error::NotInFile => write!(f, "Record would not join the file the caller saw"),
             Error::QueueClosed => write!(f, "Queue is closed and accepts no more writes"),
             Error::ReservedQueue => write!(f, "Queue is written by NormFS itself"),
+            Error::BadQueueName(name) => {
+                write!(f, "Queue name leaves the data directory: {name:?}")
+            }
             Error::MemoryBelowFloor {
                 max_memory_usage,
                 page_size,
@@ -216,6 +221,7 @@ impl std::error::Error for Error {
             Error::NotInFile => None,
             Error::QueueClosed => None,
             Error::ReservedQueue => None,
+            Error::BadQueueName(_) => None,
             Error::MemoryBelowFloor { .. } => None,
             Error::BucketUnreachable { .. } => None,
             Error::PageBelowMinimum { .. } => None,
@@ -816,6 +822,9 @@ impl NormFS {
     }
 
     pub async fn ensure_queue_exists_for_read(&self, queue: &QueueId) -> Result<(), Error> {
+        if !queue_name::queue_name_ok(queue) {
+            return Err(Error::BadQueueName(queue.as_str().to_string()));
+        }
         let queue_lock = self.queue_init_lock(queue);
         let _guard = queue_lock.lock().await;
 
@@ -832,6 +841,9 @@ impl NormFS {
     }
 
     pub async fn ensure_queue_exists_for_write(&self, queue: &QueueId) -> Result<(), Error> {
+        if !queue_name::queue_name_ok(queue) {
+            return Err(Error::BadQueueName(queue.as_str().to_string()));
+        }
         let queue_lock = self.queue_init_lock(queue);
         let _guard = queue_lock.lock().await;
 
