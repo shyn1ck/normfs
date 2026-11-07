@@ -304,6 +304,24 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn test_seed_file_acl() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let seed = Seed::generate().unwrap();
+        seed.save(temp_dir.path()).unwrap();
+
+        let out = std::process::Command::new("icacls")
+            .arg(temp_dir.path().join(SEED_FILE_NAME))
+            .output()
+            .unwrap();
+        let acl = String::from_utf8_lossy(&out.stdout);
+        let aces: Vec<&str> = acl.lines().filter(|l| l.contains(":(")).collect();
+
+        assert_eq!(aces.len(), 1, "{acl}");
+        assert!(aces[0].contains("OWNER RIGHTS:(F)"), "{acl}");
+    }
+
     #[test]
     fn test_exists() {
         let temp_dir = tempfile::tempdir().unwrap();
