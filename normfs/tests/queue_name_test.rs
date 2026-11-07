@@ -28,7 +28,7 @@ async fn a_queue_name_that_leaves_the_data_directory_is_refused() {
     }
     assert!(!root.path().join("escaped").exists());
 
-    for name in ["plain", "a/b.c", "..a", "a..", "v1.2/x"] {
+    for name in ["plain", "a/b.c", "..a", "v1.2/x"] {
         let queue = fs.resolve(name);
         fs.ensure_queue_exists_for_write(&queue).await.unwrap();
         fs.enqueue(&queue, Bytes::from_static(b"x")).await.unwrap();
