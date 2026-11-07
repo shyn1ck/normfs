@@ -1,0 +1,31 @@
+name: windows-probe
+on:
+  push:
+    branches: [ci/windows-probe-tcp]
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  loop:
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [e35ea72, HEAD]
+        target: [x86_64-pc-windows-msvc]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: choco install protoc -y --no-progress
+      - name: loop
+        shell: bash
+        run: |
+          git checkout -q ${{ matrix.ref }} -- normfs normfs-fs normfs-crypto normfs-wal normfs-store normfs-types uintn-rs Cargo.toml Cargo.lock 2>/dev/null || git checkout -q ${{ matrix.ref }}
+          git log --oneline -1 ${{ matrix.ref }}
+          cargo test -p normfs --test memory_only_test --no-run > build.log 2>&1 || { tail -30 build.log; exit 1; }
+          fails=0
+          for i in $(seq 1 40); do
+            if ! cargo test -q -p normfs --test memory_only_test > run.log 2>&1; then fails=$((fails+1)); grep -E "panicked|left|right" run.log | head -3; fi
+          done
+          echo "REF ${{ matrix.ref }}: $fails of 40 failed"
