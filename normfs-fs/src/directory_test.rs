@@ -215,12 +215,12 @@ async fn probe_short_name() {
     let short = String::from_utf8_lossy(&out.stdout).trim().to_string();
     eprintln!("PROBE short name: {short:?}");
     if short.is_empty() || short == "inference-states-long-name" {
-        eprintln!("PROBE no 8.3 names on this volume");
-        return;
+        panic!("PROBE no 8.3 names on this volume: {short:?}");
     }
     assert!(temp.path().join(&short).exists());
     let ok = fs().exact_names(temp.path(), &short).await.unwrap();
     eprintln!("PROBE exact_names({short}) = {ok}");
     assert!(!ok);
     assert!(fs().exact_names(temp.path(), "inference-states-long-name").await.unwrap());
+    panic!("PROBE OK short {short} refused, long accepted");
 }
