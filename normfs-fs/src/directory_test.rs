@@ -209,7 +209,7 @@ async fn probe_short_name() {
     let long = temp.path().join("inference-states-long-name");
     fs::create_dir(&long).unwrap();
     let out = std::process::Command::new("cmd")
-        .args(["/c", &format!("for %I in (\"{}\") do @echo %~snxI", long.display())])
+        .args(["/c", &format!("for %I in ({}) do @echo %~snxI", long.display())])
         .output()
         .unwrap();
     let short = String::from_utf8_lossy(&out.stdout).trim().to_string();
