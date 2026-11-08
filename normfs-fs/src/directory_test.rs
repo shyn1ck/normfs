@@ -201,3 +201,26 @@ async fn exact_names_refuse_only_another_spelling_of_what_is_there() {
     );
     assert!(fs.exact_names(temp.path(), "\u{e9}").await.unwrap());
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn probe_short_name() {
+    let temp = tempfile::tempdir().unwrap();
+    let long = temp.path().join("inference-states-long-name");
+    fs::create_dir(&long).unwrap();
+    let out = std::process::Command::new("cmd")
+        .args(["/c", &format!("for %I in (\"{}\") do @echo %~snxI", long.display())])
+        .output()
+        .unwrap();
+    let short = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    eprintln!("PROBE short name: {short:?}");
+    if short.is_empty() || short == "inference-states-long-name" {
+        eprintln!("PROBE no 8.3 names on this volume");
+        return;
+    }
+    assert!(temp.path().join(&short).exists());
+    let ok = fs().exact_names(temp.path(), &short).await.unwrap();
+    eprintln!("PROBE exact_names({short}) = {ok}");
+    assert!(!ok);
+    assert!(fs().exact_names(temp.path(), "inference-states-long-name").await.unwrap());
+}
