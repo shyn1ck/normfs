@@ -244,6 +244,17 @@ fn a_follow_far_past_the_end_outlives_a_burst_below_its_from() {
         let ids: Vec<u64> = got.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, [8000], "round {round}");
     }
+    let rc = unsafe { normfs_close(fs.0) };
+    eprintln!("PROBE close rc={rc} {}", last_error());
+    let fs = open(dir.path());
+    for round in 0..10 {
+        let queue = format!("inbox{round}");
+        let got = read(&fs, &queue, 0, u64::MAX);
+        let q = CString::new(queue.clone()).unwrap();
+        let mut last = 0;
+        let lrc = unsafe { normfs_last_id(fs.0, q.as_ptr(), &mut last) };
+        eprintln!("PROBE {queue} after reopen: records={} last_id={last} rc={lrc}", got.len());
+    }
     close(fs);
 }
 

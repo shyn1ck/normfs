@@ -16,8 +16,8 @@ jobs:
         run: |
           fails=0
           for i in $(seq 30); do
-            if ! RUST_LOG=warn cargo test -p normfs-capi --test capi_test a_follow_far -- --nocapture > out.txt 2>&1; then
-              fails=$((fails+1)); echo "=== run $i failed"; grep -E "panicked|WARN|ERROR" out.txt | head -40
+            RUST_LOG=warn cargo test -p normfs-capi --test capi_test a_follow_far -- --nocapture > out.txt 2>&1; if grep -q "PROBE close rc=7" out.txt; then
+              fails=$((fails+1)); echo "=== run $i failed"; grep -E "panicked|PROBE" out.txt | head -40
             fi
           done
           echo "fails=$fails/30"
