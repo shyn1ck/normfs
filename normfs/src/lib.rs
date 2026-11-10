@@ -1058,18 +1058,12 @@ impl NormFS {
             return Err(StoreError::CloseIncomplete.into());
         }
 
-        // An incomplete close leaves the queue in memory, refusing appends,
-        // while the drainer still owns the file its tail is owed to. A writer
-        // started now would take that file id and number ids from disk.
         if self.mem.is_closing(queue) {
-            if self.owes_disk(queue) {
-                return Err(Error::Wal(WalError::CloseIncomplete));
-            }
-            self.memory_pointers.settle_landed_queue(queue);
-            self.mem.close_queue(queue);
+            self.finish_close(queue).await?;
         }
 
-        if self.queue_closed_durably(queue).await {
+        let reopening = self.queue_closed_durably(queue).await;
+        if reopening {
             self.reopen_queue(queue).await?;
         }
 
@@ -1080,34 +1074,71 @@ impl NormFS {
             Drainer::Page => self.store.has_page_writer(queue),
         };
 
-        if queue_exists && has_writer {
-            return Ok(());
+        if !(queue_exists && has_writer) {
+            if queue_exists {
+                log::info!(target: "normfs", "Restarting queue '{}' from readonly to write mode", queue.short());
+            } else {
+                log::info!(target: "normfs", "Auto-starting queue '{}' in write mode for write request", queue.short());
+            }
+            self.start_queue(queue, QueueMode { readonly: false })
+                .await?;
         }
 
-        if queue_exists && !has_writer {
-            log::info!(target: "normfs", "Restarting queue '{}' from readonly to write mode", queue.short());
-        } else {
-            log::info!(target: "normfs", "Auto-starting queue '{}' in write mode for write request", queue.short());
+        // Only now: an append between the new pool and its writer would take
+        // an id the writer never hears of, and every later record waits on it.
+        if reopening {
+            self.mem.reopen(queue);
         }
+        Ok(())
+    }
 
-        self.start_queue(queue, QueueMode { readonly: false }).await
+    /// Ends a close that came back incomplete, so the start that follows is an
+    /// ordinary reopen. Refused while a retry still owns the tail's file id.
+    async fn finish_close(&self, queue: &QueueId) -> Result<(), Error> {
+        if self.persist_for(queue).drainer() != Drainer::None {
+            // Before `owed`: the drainer moves the durable mark, then clears.
+            if self.mem.pool(queue).is_some_and(|p| p.has_stranded()) {
+                return Err(Error::Wal(WalError::CloseIncomplete));
+            }
+            if let Some((first, last)) = self.mem.owed(queue) {
+                log::error!(target: "normfs",
+                    "queue '{}': records {first}..={last} were accepted but neither a writer nor a \
+                     retry holds them, so they never land; the queue restarts from disk",
+                    queue.short());
+                self.mem.close_queue(queue);
+                return Ok(());
+            }
+        }
+        self.complete_close(queue).await
+    }
+
+    /// The caller has checked everything accepted is on disk: the marker says so.
+    async fn complete_close(&self, queue: &QueueId) -> Result<(), Error> {
+        let dir = queue.to_fs_path(&self.path);
+        // The marker and its directory entry, both synced: a CREATE plan.
+        self.fs.mkdir_all(&dir).await?;
+        self.fs
+            .create_durable(&dir.join("closed"), Runs::default(), TmpMode::Trunc, true)
+            .await?;
+
+        // Everything accepted has landed, so its reserve can come down.
+        self.memory_pointers.settle_landed_queue(queue);
+        let last_id = self.mem.closed_last_id(queue);
+        self.mem.close_queue(queue);
+        self.events.emit(SystemEvent::QueueClosed {
+            queue: queue.clone(),
+            last_id,
+        });
+        Ok(())
     }
 
     // Not `is_fully_durable`: a reader's pin keeps a page from reuse, not
     // its records from disk.
     fn owes_disk(&self, queue: &QueueId) -> bool {
-        if self.persist_for(queue).drainer() == Drainer::None {
-            return false;
-        }
-        match self.mem.get_last_id(queue) {
-            Some(Some(last)) => !last
-                .to_u64()
-                .is_ok_and(|l| self.mem.is_durable_below(queue, l.saturating_add(1))),
-            _ => false,
-        }
+        self.persist_for(queue).drainer() != Drainer::None && self.mem.owed(queue).is_some()
     }
 
-    /// Undoes a close so the queue can be started for write. The marker goes
+    /// Removes the marker so the queue can be started for write. It goes
     /// first and is synced, so a crash here leaves the queue closed rather
     /// than half-open; the start that follows recovers the last id from the
     /// files the close completed.
@@ -1121,7 +1152,6 @@ impl NormFS {
                 return Err(e.into());
             }
         }
-        self.mem.reopen(queue);
         Ok(())
     }
 
@@ -2324,21 +2354,7 @@ impl NormFS {
             return Err(Error::Wal(WalError::CloseIncomplete));
         }
 
-        // The marker and its directory entry, both synced: a CREATE plan.
-        self.fs.mkdir_all(&dir).await?;
-        self.fs
-            .create_durable(&dir.join("closed"), Runs::default(), TmpMode::Trunc, true)
-            .await?;
-
-        // Everything accepted has landed, so its reserve can come down.
-        self.memory_pointers.settle_landed_queue(queue);
-        let last_id = self.mem.closed_last_id(queue);
-        self.mem.close_queue(queue);
-        self.events.emit(SystemEvent::QueueClosed {
-            queue: queue.clone(),
-            last_id,
-        });
-        Ok(())
+        self.complete_close(queue).await
     }
 
     /// Lands every queue. The data directory stays locked until the instance

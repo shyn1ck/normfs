@@ -57,10 +57,11 @@ pub(crate) fn spawn(
                 // certifying the loss. A restart clears it.
                 continue;
             }
-            pool.clear_stranded(file.stranded.generation, file.epoch);
             // The last file has no later flush to move the mark past its tail.
             // Monotone, and older debts still owed keep their own entries.
+            // Marked before the clear, so no debt is seen with no retry owning it.
             pool.mark_durable(file.stranded.last_entry_id.saturating_add(1));
+            pool.clear_stranded(file.stranded.generation, file.epoch);
             log::info!(
                 target: "normfs-wal",
                 "WAL drainer: queue '{}': file {} landed its tail, entries {}..={}",

@@ -849,3 +849,93 @@ async fn a_second_close_does_not_certify_a_tail_still_owed() {
     assert_eq!(got, want);
     fs.close().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appends_racing_a_restart_after_a_landed_tail_are_refused_or_land() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = std::sync::Arc::new(
+        NormFS::new(temp.path().to_path_buf(), failing_flush_settings())
+            .await
+            .unwrap(),
+    );
+    let queue = fs.resolve("racing");
+    let first = strand_two_records(&fs, &queue, temp.path()).await;
+    normfs_wal::heal(&first);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !fs.is_durable_through(&queue, 1) {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let appender = {
+        let (fs, queue, stop) = (fs.clone(), queue.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut accepted = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match fs.try_enqueue(&queue, Bytes::from_static(b"racer")) {
+                    Ok(id) => accepted.push(id),
+                    Err(Error::QueueClosed | Error::QueueNotFound | Error::WouldBlock) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(accepted)
+        })
+    };
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let accepted = appender
+        .join()
+        .unwrap()
+        .expect("an append took an id and failed");
+
+    let last = fs
+        .enqueue(&queue, Bytes::from_static(b"last"))
+        .await
+        .unwrap();
+    assert_eq!(last, UintN::from(2 + accepted.len() as u64));
+    let last: u64 = last.to_string().parse().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !fs.is_durable_through(&queue, last) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "record {last} never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_gap_no_retry_holds_does_not_latch_the_queue() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = NormFS::new(temp.path().to_path_buf(), NormFsSettings::all_active())
+        .await
+        .unwrap();
+    let queue = fs.resolve("gap");
+    // Read-started, so no writer: the record takes id 0 and nothing will
+    // ever write it.
+    fs.ensure_queue_exists_for_read(&queue).await.unwrap();
+    let lost = fs.enqueue(&queue, Bytes::from_static(b"lost")).await;
+    assert!(
+        matches!(lost, Err(Error::Wal(normfs_wal::WalError::WriterNotFound))),
+        "got {lost:?}"
+    );
+    let closed = fs.close_queue(&queue).await;
+    assert!(
+        matches!(
+            closed,
+            Err(Error::Wal(normfs_wal::WalError::CloseIncomplete))
+        ),
+        "got {closed:?}"
+    );
+
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    let id = fs
+        .enqueue(&queue, Bytes::from_static(b"record-0"))
+        .await
+        .unwrap();
+    assert_eq!(id, UintN::zero());
+    fs.close().await.unwrap();
+}

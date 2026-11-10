@@ -1307,6 +1307,19 @@ impl MemStore {
         pool.is_some_and(|p| p.is_durable_below(id))
     }
 
+    /// The first and last id the queue took that are not on disk yet.
+    pub fn owed(&self, queue: &QueueId) -> Option<(u64, u64)> {
+        let (last, pool) = {
+            let queues = self.queues.read().unwrap();
+            let inner = queues.get(queue)?.inner.read().unwrap();
+            (inner.last_id.as_ref().map(id_to_u64)?, inner.pool.clone()?)
+        };
+        let first = pool
+            .durable_before()
+            .min(pool.stranded_from().unwrap_or(u64::MAX));
+        (first <= last).then_some((first, last))
+    }
+
     /// Ends a closed queue's life in memory: subscriber streams end and the
     /// pages go back to their arena.
     pub fn close_queue(&self, queue: &QueueId) {
