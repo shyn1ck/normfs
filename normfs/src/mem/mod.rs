@@ -1272,6 +1272,18 @@ impl MemStore {
         }
     }
 
+    /// A close began on this queue but did not finish, so it is still here.
+    pub fn is_closing(&self, queue: &QueueId) -> bool {
+        let queues = self.queues.read().unwrap();
+        queues
+            .get(queue)
+            .is_some_and(|q| q.closed.load(Ordering::Relaxed))
+    }
+
+    pub fn queue_ids(&self) -> Vec<QueueId> {
+        self.queues.read().unwrap().keys().cloned().collect()
+    }
+
     /// Whether everything the queue accepted is on disk; the close marker
     /// must not be written while this is false.
     pub fn is_fully_durable(&self, queue: &QueueId) -> bool {

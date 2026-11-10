@@ -1058,6 +1058,17 @@ impl NormFS {
             return Err(StoreError::CloseIncomplete.into());
         }
 
+        // An incomplete close leaves the queue in memory, refusing appends,
+        // while the drainer still owns the file its tail is owed to. A writer
+        // started now would take that file id and number ids from disk.
+        if self.mem.is_closing(queue) {
+            if self.owes_disk(queue) {
+                return Err(Error::Wal(WalError::CloseIncomplete));
+            }
+            self.memory_pointers.settle_landed_queue(queue);
+            self.mem.close_queue(queue);
+        }
+
         if self.queue_closed_durably(queue).await {
             self.reopen_queue(queue).await?;
         }
@@ -1080,6 +1091,20 @@ impl NormFS {
         }
 
         self.start_queue(queue, QueueMode { readonly: false }).await
+    }
+
+    // Not `is_fully_durable`: a reader's pin keeps a page from reuse, not
+    // its records from disk.
+    fn owes_disk(&self, queue: &QueueId) -> bool {
+        if self.persist_for(queue).drainer() == Drainer::None {
+            return false;
+        }
+        match self.mem.get_last_id(queue) {
+            Some(Some(last)) => !last
+                .to_u64()
+                .is_ok_and(|l| self.mem.is_durable_below(queue, l.saturating_add(1))),
+            _ => false,
+        }
     }
 
     /// Undoes a close so the queue can be started for write. The marker goes
@@ -2338,6 +2363,12 @@ impl NormFS {
         self.memory_pointers.flush_all().await.map_err(Error::Io)?;
         store_result?;
         wal_result?;
+
+        // A retry close finds no writers left; a tail an earlier one
+        // stranded is owed until the drainer lands it.
+        if self.mem.queue_ids().iter().any(|q| self.owes_disk(q)) {
+            return Err(Error::Wal(WalError::CloseIncomplete));
+        }
 
         log::info!(target: "normfs", "NormFS closed successfully");
         Ok(())

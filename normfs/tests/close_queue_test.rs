@@ -677,3 +677,175 @@ async fn writes_after_close_has_begun_are_refused() {
     let refused = fs.try_enqueue(&queue, Bytes::from_static(b"late"));
     assert!(matches!(refused, Err(Error::Closing)), "got {refused:?}");
 }
+
+fn failing_flush_settings() -> NormFsSettings {
+    let mut settings = NormFsSettings::all_active();
+    settings.wal_settings.flush_max_retries = 2;
+    settings.wal_settings.flush_retry_delay = Duration::from_millis(1);
+    settings
+}
+
+async fn read_records(fs: &NormFS, queue: &normfs::QueueId, count: u64) -> Vec<(u64, Bytes)> {
+    fs.ensure_queue_exists_for_read(queue).await.unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    fs.read(queue, ReadPosition::Absolute(UintN::zero()), count, 1, tx)
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while let Ok(Some(entry)) = timeout(Duration::from_secs(5), rx.recv()).await {
+        got.push((entry.id.to_string().parse().unwrap(), entry.data));
+    }
+    got
+}
+
+/// Leaves records 0 and 1 owed to file 1, which holds only its header, until
+/// the returned path is healed.
+async fn strand_two_records(
+    fs: &NormFS,
+    queue: &normfs::QueueId,
+    path: &std::path::Path,
+) -> std::path::PathBuf {
+    fs.ensure_queue_exists_for_write(queue).await.unwrap();
+    let first = UintN::from(1u64).to_file_path(queue.to_wal_dir(path).to_str().unwrap(), "wal");
+    normfs_wal::fail_flushes(&first, u32::MAX);
+    write_records(fs, queue, 2).await;
+    let closed = fs.close_queue(queue).await;
+    assert!(
+        matches!(
+            closed,
+            Err(Error::Wal(normfs_wal::WalError::CloseIncomplete))
+        ),
+        "got {closed:?}"
+    );
+    first
+}
+
+#[tokio::test]
+async fn a_restart_for_write_waits_for_a_tail_still_owed() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = temp.path().to_path_buf();
+    {
+        let fs = NormFS::new(path.clone(), failing_flush_settings())
+            .await
+            .unwrap();
+        let queue = fs.resolve("owed");
+        let first = strand_two_records(&fs, &queue, &path).await;
+
+        // File 1 still belongs to the retry: a writer started now would
+        // take its id and lose what the retry later puts there.
+        let refused = fs.ensure_queue_exists_for_write(&queue).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Error::Wal(normfs_wal::WalError::CloseIncomplete))
+            ),
+            "got {refused:?}"
+        );
+
+        normfs_wal::heal(&first);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while let Err(e) = fs.ensure_queue_exists_for_write(&queue).await {
+            assert!(tokio::time::Instant::now() < deadline, "last answer {e:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let id = fs
+            .enqueue(&queue, Bytes::from_static(b"record-2"))
+            .await
+            .unwrap();
+        assert_eq!(id, UintN::from(2u64));
+        fs.close().await.unwrap();
+    }
+
+    let fs = NormFS::new(path, NormFsSettings::all_active())
+        .await
+        .unwrap();
+    let queue = fs.resolve("owed");
+    let got = read_records(&fs, &queue, 3).await;
+    let want: Vec<(u64, Bytes)> = (0..3u64)
+        .map(|i| (i, Bytes::from(format!("record-{i}"))))
+        .collect();
+    assert_eq!(got, want);
+    fs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_queue_whose_tail_landed_after_its_close_takes_writes_again() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = NormFS::new(temp.path().to_path_buf(), failing_flush_settings())
+        .await
+        .unwrap();
+    let queue = fs.resolve("late");
+    let first = strand_two_records(&fs, &queue, temp.path()).await;
+    normfs_wal::heal(&first);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !fs.is_durable_through(&queue, 1) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the tail never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    let id = fs
+        .enqueue(&queue, Bytes::from_static(b"record-2"))
+        .await
+        .unwrap();
+    assert_eq!(id, UintN::from(2u64));
+    fs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_second_close_does_not_certify_a_tail_still_owed() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = temp.path().to_path_buf();
+    {
+        let fs = NormFS::new(path.clone(), failing_flush_settings())
+            .await
+            .unwrap();
+        let queue = fs.resolve("owed");
+        fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+        write_records(&fs, &queue, 1).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !fs.is_durable_through(&queue, 0) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let first =
+            UintN::from(1u64).to_file_path(queue.to_wal_dir(&path).to_str().unwrap(), "wal");
+        normfs_wal::fail_flushes(&first, u32::MAX);
+        fs.enqueue(&queue, Bytes::from_static(b"record-1"))
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let closed = fs.close().await;
+            assert!(
+                matches!(
+                    closed,
+                    Err(Error::Wal(normfs_wal::WalError::CloseIncomplete))
+                ),
+                "record 1 is not on disk, got {closed:?}"
+            );
+        }
+
+        normfs_wal::heal(&first);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while let Err(e) = fs.close().await {
+            assert!(tokio::time::Instant::now() < deadline, "last answer {e:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    let fs = NormFS::new(path, NormFsSettings::all_active())
+        .await
+        .unwrap();
+    let queue = fs.resolve("owed");
+    let got = read_records(&fs, &queue, 2).await;
+    let want: Vec<(u64, Bytes)> = (0..2u64)
+        .map(|i| (i, Bytes::from(format!("record-{i}"))))
+        .collect();
+    assert_eq!(got, want);
+    fs.close().await.unwrap();
+}
