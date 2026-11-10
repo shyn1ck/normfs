@@ -222,6 +222,7 @@ fn a_follow_past_the_end_starts_at_its_from_id() {
 // decides; ten rounds make missing it on every one unlikely.
 #[test]
 fn a_follow_far_past_the_end_outlives_a_burst_below_its_from() {
+    let _ = env_logger::builder().is_test(false).try_init();
     let dir = tempfile::tempdir().unwrap();
     let fs = open(dir.path());
     for round in 0..10 {
