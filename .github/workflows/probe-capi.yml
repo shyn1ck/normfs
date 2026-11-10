@@ -1,0 +1,23 @@
+name: probe-capi
+on:
+  push:
+    branches: [probe/capi-single]
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: cargo test -p normfs-capi --locked --test capi_test --no-run
+      - name: loop
+        run: |
+          fails=0
+          for i in $(seq 30); do
+            if ! cargo test -p normfs-capi --locked --test capi_test > out.txt 2>&1; then
+              fails=$((fails+1)); echo "=== run $i failed"; grep -E "panicked|FAILED|left|right" out.txt | head -10
+            fi
+          done
+          echo "fails=$fails/30"
