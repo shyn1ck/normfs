@@ -1045,7 +1045,9 @@ impl NormFS {
         }
 
         log::info!(target: "normfs", "Auto-starting queue '{}' in readonly mode for read request", queue.short());
-        self.start_queue(queue, QueueMode { readonly: true }).await
+        let given_out = self.mem.given_out(queue);
+        self.start_queue(queue, QueueMode { readonly: true }, given_out)
+            .await
     }
 
     pub async fn ensure_queue_exists_for_write(&self, queue: &QueueId) -> Result<(), Error> {
@@ -1059,6 +1061,12 @@ impl NormFS {
             return Err(StoreError::CloseIncomplete.into());
         }
 
+        if self.mem.is_closing(queue) {
+            self.finish_close(queue)?;
+        }
+
+        // Ids a client was given that never landed are not given out again.
+        let given_out = self.mem.given_out(queue);
         if self.queue_closed_durably(queue).await {
             self.reopen_queue(queue).await?;
         }
@@ -1080,7 +1088,58 @@ impl NormFS {
             log::info!(target: "normfs", "Auto-starting queue '{}' in write mode for write request", queue.short());
         }
 
-        self.start_queue(queue, QueueMode { readonly: false }).await
+        self.start_queue(queue, QueueMode { readonly: false }, given_out)
+            .await?;
+        self.mem.started_for_write(queue);
+        Ok(())
+    }
+
+    /// Ends a close that came back incomplete. No marker: the caller reopens at
+    /// once. Refused while a retry still owns the tail's file id.
+    fn finish_close(&self, queue: &QueueId) -> Result<(), Error> {
+        // A page writer still landing its file was refused by the caller.
+        if self.settle_debt(queue, "; the queue restarts past them")? {
+            self.release_closed(queue);
+            return Ok(());
+        }
+        // Everything accepted has landed, so its reserve can come down.
+        self.memory_pointers.settle_landed_queue(queue);
+        self.release_closed(queue);
+        Ok(())
+    }
+
+    // Emitted on every path, so the restart's QueueStarted never follows another.
+    fn release_closed(&self, queue: &QueueId) {
+        let last_id = self.mem.closed_last_id(queue);
+        self.mem.close_queue(queue);
+        self.events.emit(SystemEvent::QueueClosed {
+            queue: queue.clone(),
+            last_id,
+        });
+    }
+
+    // CloseIncomplete while a retry may still land something; tails no retry
+    // can land are logged as lost, and true says there were some. Not
+    // `is_fully_durable`: a reader's pin keeps a page from reuse, not its
+    // records from disk.
+    fn settle_debt(&self, queue: &QueueId, then: &str) -> Result<bool, Error> {
+        if self.persist_for(queue).drainer() == Drainer::None {
+            return Ok(false);
+        }
+        match self.mem.debt(queue) {
+            normfs_wal::Debt::Clear => Ok(false),
+            normfs_wal::Debt::Owed => Err(Error::Wal(WalError::CloseIncomplete)),
+            normfs_wal::Debt::Abandoned(lost) => {
+                for (first, last) in &lost {
+                    log::error!(target: "normfs",
+                        "queue '{}': records {first}..={last} were not written and no retry \
+                         holds them, so they never reach disk{then}",
+                        queue.short());
+                }
+                self.memory_pointers.keep_reserve(queue);
+                Ok(true)
+            }
+        }
     }
 
     /// Undoes a close so the queue can be started for write. The marker goes
@@ -1758,6 +1817,7 @@ impl NormFS {
         &self,
         queue: &QueueId,
         persist: Persist,
+        given_out: Option<UintN>,
     ) -> Result<(UintN, normfs_wal::WalHeader, Option<UintN>, bool), Error> {
         let (mut file_id, mut header, mut last_id) = self.continue_queue(queue).await?;
 
@@ -1773,6 +1833,12 @@ impl NormFS {
         // Past the reserve too, even when the bucket answered: ids an earlier
         // life gave out and never landed are not given out again.
         if let Some(last) = self.memory_pointers.used_id(queue) {
+            if last_id.as_ref().is_none_or(|l| last > *l) {
+                last_id = Some(last);
+            }
+        }
+
+        if let Some(last) = given_out {
             if last_id.as_ref().is_none_or(|l| last > *l) {
                 last_id = Some(last);
             }
@@ -1801,7 +1867,12 @@ impl NormFS {
         });
     }
 
-    async fn start_queue(&self, queue: &QueueId, mode: QueueMode) -> Result<(), Error> {
+    async fn start_queue(
+        &self,
+        queue: &QueueId,
+        mode: QueueMode,
+        given_out: Option<UintN>,
+    ) -> Result<(), Error> {
         log::info!(target: "normfs", "========================================");
         log::info!(target: "normfs", "Starting queue: '{}' (readonly={})", queue.short(), mode.readonly);
         log::info!(target: "normfs", "========================================");
@@ -1839,7 +1910,16 @@ impl NormFS {
             .into());
         }
 
-        let (file_id, header, last_entry_id, unchecked) = self.resume_point(queue, persist).await?;
+        let (file_id, mut header, mut last_entry_id, unchecked) =
+            self.resume_point(queue, persist, given_out).await?;
+        // A queue still in memory, say from a failed start, numbers from its
+        // own last id, so its writer has to expect the same next id.
+        if let Some(Some(mem_last)) = self.mem.get_last_id(queue) {
+            if last_entry_id.as_ref().is_none_or(|l| mem_last > *l) {
+                header.num_entries_before = mem_last.increment();
+                last_entry_id = Some(mem_last);
+            }
+        }
 
         log::info!(target: "normfs", "----------------------------------------");
         log::info!(target: "normfs", "Queue '{}' - Recovery complete:", queue.short());
@@ -2298,14 +2378,10 @@ impl NormFS {
             Drainer::None => {}
         }
 
-        // The marker certifies everything accepted is on disk. Records a
-        // failed flush stranded stay in the WAL file for recovery, and a
-        // store file that did not land keeps retrying; the close stays
-        // incomplete rather than certifying loss. Memory-only has no disk to
-        // certify: its close only ends the write side.
-        if drainer != Drainer::None && !self.mem.is_fully_durable(queue) {
-            return Err(Error::Wal(WalError::CloseIncomplete));
-        }
+        // The marker certifies everything accepted is on disk, except tails no
+        // retry can land, which are logged as lost, as a restart and close() do.
+        // Memory-only has no disk to certify: its close only ends the write side.
+        let lost = self.settle_debt(queue, "")?;
 
         // The marker and its directory entry, both synced: a CREATE plan.
         self.fs.mkdir_all(&dir).await?;
@@ -2313,19 +2389,17 @@ impl NormFS {
             .create_durable(&dir.join("closed"), Runs::default(), TmpMode::Trunc, true)
             .await?;
 
-        // Everything accepted has landed, so its reserve can come down.
-        self.memory_pointers.settle_landed_queue(queue);
-        let last_id = self.mem.closed_last_id(queue);
-        self.mem.close_queue(queue);
-        self.events.emit(SystemEvent::QueueClosed {
-            queue: queue.clone(),
-            last_id,
-        });
+        if !lost {
+            // Everything accepted has landed, so its reserve can come down.
+            self.memory_pointers.settle_landed_queue(queue);
+        }
+        self.release_closed(queue);
         Ok(())
     }
 
     /// Lands every queue. The data directory stays locked until the instance
-    /// is dropped.
+    /// is dropped. Incomplete while a retry still holds a tail; a tail no
+    /// retry can land is logged as lost and does not block the close.
     pub async fn close(&self) -> Result<(), Error> {
         log::info!(target: "normfs", "Closing NormFS");
 
@@ -2340,12 +2414,24 @@ impl NormFS {
         let store_result = self.store.close().await;
         let wal_result = self.wal.close().await;
         self.memory_pointer_task.abort();
-        if store_result.is_ok() {
+        // A retry close finds no writers left; a tail an earlier one stranded
+        // is owed until the drainer lands it, and nothing settles before then.
+        let owed = self.mem.queue_ids().iter().any(|q| {
+            self.persist_for(q).drainer() != Drainer::None
+                && self.mem.debt(q) == normfs_wal::Debt::Owed
+        });
+        if store_result.is_ok() && !owed {
+            for queue in self.mem.queue_ids() {
+                self.settle_debt(&queue, "")?;
+            }
             self.memory_pointers.settle_landed();
         }
         self.memory_pointers.flush_all().await.map_err(Error::Io)?;
         store_result?;
         wal_result?;
+        if owed {
+            return Err(Error::Wal(WalError::CloseIncomplete));
+        }
 
         log::info!(target: "normfs", "NormFS closed successfully");
         Ok(())

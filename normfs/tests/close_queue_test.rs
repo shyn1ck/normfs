@@ -678,6 +678,235 @@ async fn writes_after_close_has_begun_are_refused() {
     assert!(matches!(refused, Err(Error::Closing)), "got {refused:?}");
 }
 
+fn failing_flush_settings() -> NormFsSettings {
+    let mut settings = NormFsSettings::all_active();
+    settings.wal_settings.flush_max_retries = 2;
+    settings.wal_settings.flush_retry_delay = Duration::from_millis(1);
+    settings
+}
+
+async fn read_records(fs: &NormFS, queue: &normfs::QueueId, count: u64) -> Vec<(u64, Bytes)> {
+    fs.ensure_queue_exists_for_read(queue).await.unwrap();
+    let (tx, mut rx) = mpsc::channel(16);
+    fs.read(queue, ReadPosition::Absolute(UintN::zero()), count, 1, tx)
+        .await
+        .unwrap();
+    let mut got = Vec::new();
+    while let Ok(Some(entry)) = timeout(Duration::from_secs(5), rx.recv()).await {
+        got.push((entry.id.to_string().parse().unwrap(), entry.data));
+    }
+    got
+}
+
+/// Leaves records 0 and 1 owed to file 1, which holds only its header, until
+/// the returned path is healed.
+async fn strand_two_records(
+    fs: &NormFS,
+    queue: &normfs::QueueId,
+    path: &std::path::Path,
+) -> std::path::PathBuf {
+    fs.ensure_queue_exists_for_write(queue).await.unwrap();
+    let first = UintN::from(1u64).to_file_path(queue.to_wal_dir(path).to_str().unwrap(), "wal");
+    normfs_wal::fail_flushes(&first, u32::MAX);
+    write_records(fs, queue, 2).await;
+    let closed = fs.close_queue(queue).await;
+    assert!(
+        matches!(
+            closed,
+            Err(Error::Wal(normfs_wal::WalError::CloseIncomplete))
+        ),
+        "got {closed:?}"
+    );
+    first
+}
+
+#[tokio::test]
+async fn a_restart_for_write_is_refused_while_a_tail_is_owed() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = temp.path().to_path_buf();
+    {
+        let fs = NormFS::new(path.clone(), failing_flush_settings())
+            .await
+            .unwrap();
+        let queue = fs.resolve("owed");
+        let first = strand_two_records(&fs, &queue, &path).await;
+
+        // File 1 still belongs to the retry: a writer started now would
+        // take its id and lose what the retry later puts there.
+        let refused = fs.ensure_queue_exists_for_write(&queue).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Error::Wal(normfs_wal::WalError::CloseIncomplete))
+            ),
+            "got {refused:?}"
+        );
+
+        normfs_wal::heal(&first);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while let Err(e) = fs.ensure_queue_exists_for_write(&queue).await {
+            assert!(tokio::time::Instant::now() < deadline, "last answer {e:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let id = fs
+            .enqueue(&queue, Bytes::from_static(b"record-2"))
+            .await
+            .unwrap();
+        assert_eq!(id, UintN::from(2u64));
+        fs.close().await.unwrap();
+    }
+
+    let fs = NormFS::new(path, NormFsSettings::all_active())
+        .await
+        .unwrap();
+    let queue = fs.resolve("owed");
+    let got = read_records(&fs, &queue, 3).await;
+    let want: Vec<(u64, Bytes)> = (0..3u64)
+        .map(|i| (i, Bytes::from(format!("record-{i}"))))
+        .collect();
+    assert_eq!(got, want);
+    fs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_queue_whose_tail_landed_after_its_close_takes_writes_again() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = NormFS::new(temp.path().to_path_buf(), failing_flush_settings())
+        .await
+        .unwrap();
+    let queue = fs.resolve("late");
+    let first = strand_two_records(&fs, &queue, temp.path()).await;
+    normfs_wal::heal(&first);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !fs.is_durable_through(&queue, 1) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the tail never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    let id = fs
+        .enqueue(&queue, Bytes::from_static(b"record-2"))
+        .await
+        .unwrap();
+    assert_eq!(id, UintN::from(2u64));
+    fs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_second_close_does_not_certify_a_tail_still_owed() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let path = temp.path().to_path_buf();
+    {
+        let fs = NormFS::new(path.clone(), failing_flush_settings())
+            .await
+            .unwrap();
+        let queue = fs.resolve("owed");
+        fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+        write_records(&fs, &queue, 1).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !fs.is_durable_through(&queue, 0) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let first =
+            UintN::from(1u64).to_file_path(queue.to_wal_dir(&path).to_str().unwrap(), "wal");
+        normfs_wal::fail_flushes(&first, u32::MAX);
+        fs.enqueue(&queue, Bytes::from_static(b"record-1"))
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let closed = fs.close().await;
+            assert!(
+                matches!(
+                    closed,
+                    Err(Error::Wal(normfs_wal::WalError::CloseIncomplete))
+                ),
+                "record 1 is not on disk, got {closed:?}"
+            );
+        }
+
+        normfs_wal::heal(&first);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while let Err(e) = fs.close().await {
+            assert!(tokio::time::Instant::now() < deadline, "last answer {e:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    let fs = NormFS::new(path, NormFsSettings::all_active())
+        .await
+        .unwrap();
+    let queue = fs.resolve("owed");
+    let got = read_records(&fs, &queue, 2).await;
+    let want: Vec<(u64, Bytes)> = (0..2u64)
+        .map(|i| (i, Bytes::from(format!("record-{i}"))))
+        .collect();
+    assert_eq!(got, want);
+    fs.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn appends_racing_a_restart_after_a_landed_tail_are_refused_or_land() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = std::sync::Arc::new(
+        NormFS::new(temp.path().to_path_buf(), failing_flush_settings())
+            .await
+            .unwrap(),
+    );
+    let queue = fs.resolve("racing");
+    let first = strand_two_records(&fs, &queue, temp.path()).await;
+    normfs_wal::heal(&first);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !fs.is_durable_through(&queue, 1) {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let appender = {
+        let (fs, queue, stop) = (fs.clone(), queue.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut accepted = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match fs.try_enqueue(&queue, Bytes::from_static(b"racer")) {
+                    Ok(id) => accepted.push(id),
+                    Err(Error::QueueClosed | Error::QueueNotFound | Error::WouldBlock) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(accepted)
+        })
+    };
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let accepted = appender
+        .join()
+        .unwrap()
+        .expect("an append took an id and failed");
+
+    let last = fs
+        .enqueue(&queue, Bytes::from_static(b"last"))
+        .await
+        .unwrap();
+    assert_eq!(last, UintN::from(2 + accepted.len() as u64));
+    let last: u64 = last.to_string().parse().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !fs.is_durable_through(&queue, last) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "record {last} never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fs.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn an_append_no_writer_can_take_is_refused_without_an_id() {
     let temp = tempfile::TempDir::new().unwrap();
@@ -701,6 +930,114 @@ async fn an_append_no_writer_can_take_is_refused_without_an_id() {
 }
 
 #[tokio::test]
+async fn a_tail_no_retry_can_land_does_not_latch_the_queue() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = NormFS::new(temp.path().to_path_buf(), failing_flush_settings())
+        .await
+        .unwrap();
+    let queue = fs.resolve("fatal");
+    let first = strand_two_records(&fs, &queue, temp.path()).await;
+    // The retry reopens the file it owes, never creates it: gone is final.
+    std::fs::remove_file(&first).unwrap();
+    normfs_wal::heal(&first);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while let Err(e) = fs.ensure_queue_exists_for_write(&queue).await {
+        assert!(tokio::time::Instant::now() < deadline, "last answer {e:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let id = fs
+        .enqueue(&queue, Bytes::from_static(b"after"))
+        .await
+        .unwrap();
+    assert_eq!(id, UintN::from(2u64));
+    fs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tail_no_retry_can_land_does_not_fail_every_close() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = NormFS::new(temp.path().to_path_buf(), failing_flush_settings())
+        .await
+        .unwrap();
+    let queue = fs.resolve("fatal");
+    let first = strand_two_records(&fs, &queue, temp.path()).await;
+    std::fs::remove_file(&first).unwrap();
+    normfs_wal::heal(&first);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while let Err(e) = fs.close().await {
+        assert!(tokio::time::Instant::now() < deadline, "last answer {e:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_close_queue_retried_after_a_tail_no_retry_can_land_completes() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = NormFS::new(temp.path().to_path_buf(), failing_flush_settings())
+        .await
+        .unwrap();
+    let queue = fs.resolve("fatal");
+    let first = strand_two_records(&fs, &queue, temp.path()).await;
+    std::fs::remove_file(&first).unwrap();
+    normfs_wal::heal(&first);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while let Err(e) = fs.close_queue(&queue).await {
+        assert!(tokio::time::Instant::now() < deadline, "last answer {e:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(queue.to_fs_path(temp.path()).join("closed").is_file());
+    fs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn records_a_close_cut_off_from_their_file_do_not_latch_the_queue() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let mut settings = NormFsSettings::all_active();
+    settings.wal_settings.max_file_size = 1024;
+    let fs = NormFS::new(temp.path().to_path_buf(), settings)
+        .await
+        .unwrap();
+    let queue = fs.resolve("rotation");
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    // Directories where the next files go: the rotation cannot open one.
+    let dir = queue.to_wal_dir(temp.path());
+    let blocked: Vec<_> = (2u64..6)
+        .map(|id| UintN::from(id).to_file_path(dir.to_str().unwrap(), "wal"))
+        .collect();
+    for path in &blocked {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let mut last = UintN::zero();
+    for _ in 0..300 {
+        last = fs
+            .enqueue(&queue, Bytes::from(vec![7u8; 4000]))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fs.close_queue(&queue).await.unwrap();
+    assert!(queue.to_fs_path(temp.path()).join("closed").is_file());
+    for path in &blocked {
+        std::fs::remove_dir(path).unwrap();
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while let Err(e) = fs.ensure_queue_exists_for_write(&queue).await {
+        assert!(tokio::time::Instant::now() < deadline, "last answer {e:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let id = fs
+        .enqueue(&queue, Bytes::from_static(b"after"))
+        .await
+        .unwrap();
+    assert_eq!(id, last.increment());
+    fs.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_failed_reopen_does_not_leave_the_queue_closed_in_memory() {
     let temp = tempfile::TempDir::new().unwrap();
     let fs = NormFS::new(temp.path().to_path_buf(), NormFsSettings::all_active())
@@ -720,6 +1057,49 @@ async fn a_failed_reopen_does_not_leave_the_queue_closed_in_memory() {
         matches!(refused, Err(Error::QueueNotFound)),
         "got {refused:?}"
     );
+    fs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_start_after_an_abandoned_tail_keeps_its_ids() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = NormFS::new(temp.path().to_path_buf(), failing_flush_settings())
+        .await
+        .unwrap();
+    let queue = fs.resolve("fatal");
+    let first = strand_two_records(&fs, &queue, temp.path()).await;
+    std::fs::remove_file(&first).unwrap();
+    normfs_wal::heal(&first);
+
+    let wal = queue.to_wal_dir(temp.path());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        std::fs::remove_dir_all(&wal).unwrap();
+        std::fs::write(&wal, b"not a directory").unwrap();
+        // CloseIncomplete means the drainer has not given the tail up yet.
+        match fs.ensure_queue_exists_for_write(&queue).await {
+            Err(Error::Wal(normfs_wal::WalError::CloseIncomplete)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the tail was never abandoned"
+                );
+                std::fs::remove_file(&wal).unwrap();
+                std::fs::create_dir_all(&wal).unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(_) => break,
+            Ok(()) => panic!("a start into a file in place of the WAL dir succeeded"),
+        }
+    }
+    std::fs::remove_file(&wal).unwrap();
+    std::fs::create_dir_all(&wal).unwrap();
+
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    let id = fs
+        .enqueue(&queue, Bytes::from_static(b"after"))
+        .await
+        .unwrap();
+    assert_eq!(id, UintN::from(2u64));
     fs.close().await.unwrap();
 }
 

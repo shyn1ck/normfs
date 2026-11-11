@@ -251,6 +251,12 @@ impl MemoryPointers {
         }
     }
 
+    /// A queue that lost records is never settled: its reserve stays above
+    /// the ids it gave out, not lowered to what landed.
+    pub(crate) fn keep_reserve(&self, queue: &QueueId) {
+        self.state.lock().unwrap().landed_now.remove(queue.as_str());
+    }
+
     /// [`MemoryPointers::settle_landed`] for one queue a close drained; the
     /// next write takes it along.
     pub(crate) fn settle_landed_queue(&self, queue: &QueueId) {

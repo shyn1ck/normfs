@@ -57,9 +57,9 @@ struct WriterState {
     // Set by `WalWriter::close`; the rotation retry loop checks it, because
     // that loop runs on the only task that could dequeue the close request.
     closing: Arc<std::sync::atomic::AtomicBool>,
-    // A rotation stood down for a close, so this writer has no file. Entries
-    // that still arrive are dropped loudly.
-    rotation_abandoned: bool,
+    // A rotation stood down for a close, so this writer has no file from this
+    // id on. Entries that still arrive are dropped loudly.
+    rotation_abandoned: Option<u64>,
     // Spawned the first time a file is left owing records; outlives this task,
     // so a close that reports itself incomplete can be followed by one that
     // succeeds.
@@ -135,7 +135,7 @@ impl WalWriter {
             pool,
             file_epoch: 0,
             closing: Arc::clone(&closing),
-            rotation_abandoned: false,
+            rotation_abandoned: None,
             drainer: None,
         };
 
@@ -204,6 +204,18 @@ impl WalWriter {
                         // migrate: no writer will ever rotate it out. A file
                         // that lost entries stays in the WAL for recovery.
                         let closed_ok = flushed && state.buffer.pending.is_empty();
+                        // Every append is placed by now, so what an abandoned
+                        // rotation dropped, or what still waits for an id that
+                        // never came, is known in full.
+                        let parked = (!state.buffer.pending.is_empty()).then(|| {
+                            let written = state.buffer.last_written_id.as_ref();
+                            written
+                                .map_or(0, |id| id.to_u64().unwrap_or(u64::MAX).saturating_add(1))
+                        });
+                        let unwritten = [state.rotation_abandoned, parked].into_iter().flatten();
+                        if let (Some(first), Some(pool)) = (unwritten.min(), state.pool.as_ref()) {
+                            pool.abandon_unwritten(first);
+                        }
                         // The last file has no rotation behind it to notice what
                         // its closing flush left owed. Not awaited: this close
                         // reports itself incomplete, and a later one succeeds.
@@ -310,7 +322,7 @@ impl WriterState {
             data.len()
         );
 
-        if self.rotation_abandoned {
+        if self.rotation_abandoned.is_some() {
             log::error!(
                 "WAL writer: queue '{}' entry {}: dropped -- a close abandoned a rotation, \
                  so this writer has no file to give it",
@@ -419,7 +431,7 @@ impl WriterState {
                     pool.note_handed_over(id);
                 }
                 if !self.rotate(entry_id.clone(), data_len).await {
-                    self.rotation_abandoned = true;
+                    self.rotation_abandoned = Some(entry_id.to_u64().unwrap_or(u64::MAX));
                     outcome = Err(WalError::IoError(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "the writer's rotation was abandoned by a close",
@@ -536,6 +548,7 @@ impl WriterState {
             stranded.last_entry_id
         );
 
+        let generation = stranded.generation;
         let file = Box::new(crate::drainer::StrandedFile {
             queue_id: self.queue_id.clone(),
             file_id: self.file_id.clone(),
@@ -569,6 +582,8 @@ impl WriterState {
                 self.queue_id.short(),
                 self.file_id
             );
+            // Nothing will retry it: owed, but a restart may go past it.
+            pool.abandon_stranded(generation, self.file_epoch);
         }
         true
     }

@@ -48,19 +48,30 @@ pub(crate) fn spawn(
     wal_complete_sender: mpsc::UnboundedSender<WalFile>,
     written_sender: mpsc::UnboundedSender<(QueueId, UintN)>,
 ) -> mpsc::UnboundedSender<DrainRequest> {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        while let Some(DrainRequest::Retry(file)) = rx.recv().await {
-            if !land(backend.as_ref(), &file).await {
-                // Left owed on purpose: a close certifies that everything
-                // accepted is on disk, and saying "incomplete" for ever beats
-                // certifying the loss. A restart clears it.
+        let mut guard = AbandonOnExit {
+            pool: pool.clone(),
+            rx,
+            current: None,
+        };
+        while let Some(DrainRequest::Retry(file)) = guard.rx.recv().await {
+            guard.current = Some((file.stranded.generation, file.epoch));
+            let landed = land(backend.as_ref(), &file).await;
+            guard.current = None;
+            if !landed {
+                // Still owed, so never reported durable; abandoned, so a
+                // restart or close logs it as lost instead of waiting for ever.
+                pool.abandon_stranded(file.stranded.generation, file.epoch);
                 continue;
             }
-            pool.clear_stranded(file.stranded.generation, file.epoch);
             // The last file has no later flush to move the mark past its tail.
             // Monotone, and older debts still owed keep their own entries.
-            pool.mark_durable(file.stranded.last_entry_id.saturating_add(1));
+            pool.land_stranded(
+                file.stranded.generation,
+                file.epoch,
+                file.stranded.last_entry_id.saturating_add(1),
+            );
             log::info!(
                 target: "normfs-wal",
                 "WAL drainer: queue '{}': file {} landed its tail, entries {}..={}",
@@ -74,6 +85,26 @@ pub(crate) fn spawn(
         }
     });
     tx
+}
+
+/// A drainer that panics would leave its files looking retried for ever.
+struct AbandonOnExit {
+    pool: Arc<PagePool>,
+    rx: mpsc::UnboundedReceiver<DrainRequest>,
+    current: Option<(u64, u64)>,
+}
+
+impl Drop for AbandonOnExit {
+    fn drop(&mut self) {
+        if let Some((generation, epoch)) = self.current.take() {
+            self.pool.abandon_stranded(generation, epoch);
+        }
+        self.rx.close();
+        while let Ok(DrainRequest::Retry(file)) = self.rx.try_recv() {
+            self.pool
+                .abandon_stranded(file.stranded.generation, file.epoch);
+        }
+    }
 }
 
 /// False only for a failure no retry can pass, never for giving up on one.

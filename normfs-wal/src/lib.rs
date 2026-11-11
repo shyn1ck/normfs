@@ -33,8 +33,8 @@ pub use normfs_fs::fault::{fail_flushes, heal};
 pub use normfs_fs::{Fs, FsConfig};
 pub use pack_pool::{PackPool, PackSlot};
 pub use page_pool::{
-    FileMark, FileRuns, MIN_PAGE_SIZE, PagePool, PendingWrite, Placement, PoolError, RotateHint,
-    StallListener, StallReport, Stranded, max_record_len,
+    Debt, FileMark, FileRuns, MIN_PAGE_SIZE, PagePool, PendingWrite, Placement, PoolError,
+    RotateHint, StallListener, StallReport, Stranded, max_record_len,
 };
 pub use reader::{
     PausableRead, ReadRangeResult, WalBytesPause, WalContent, count_entries, get_wal_header,

@@ -8,7 +8,7 @@ use crate::config::PoolKind;
 use bytes::Bytes;
 use normfs_types::events::{EventSink, SystemEvent};
 use normfs_types::{DataSource, QueueId, ReadEntry, SubscriberCallback};
-use normfs_wal::{AppendOutcome, FileMark, PagePool, Placement, WalArena};
+use normfs_wal::{AppendOutcome, Debt, FileMark, PagePool, Placement, WalArena};
 use uintn::UintN;
 
 // Geometry of the in-memory paged store. Every record fits a page -- one that
@@ -117,6 +117,9 @@ pub struct MemStore {
     /// the queue from the map above, and a later follow still needs to know
     /// where the sequence ended. A reopen removes the entry.
     closed: RwLock<HashMap<QueueId, Option<UintN>>>,
+    /// A reopened queue's recorded last id, kept until a start succeeds so a
+    /// failed one cannot hand those ids out again.
+    reopened: RwLock<HashMap<QueueId, UintN>>,
     events: EventSink,
 }
 
@@ -1154,6 +1157,7 @@ impl MemStore {
             passive_arena,
             next_ring_id: AtomicU64::new(0),
             closed: RwLock::new(HashMap::new()),
+            reopened: RwLock::new(HashMap::new()),
             events: normfs_types::events::discard(),
         })
     }
@@ -1332,14 +1336,32 @@ impl MemStore {
     }
 
     pub fn reopen(&self, queue: &QueueId) {
-        self.closed.write().unwrap().remove(queue);
+        if let Some(Some(last)) = self.closed.write().unwrap().remove(queue) {
+            self.reopened.write().unwrap().insert(queue.clone(), last);
+        }
+    }
+
+    pub fn started_for_write(&self, queue: &QueueId) {
+        self.reopened.write().unwrap().remove(queue);
     }
 
     /// The last id a closed queue ever assigned; `None` means it never
     /// wrote.
     pub fn closed_last_id(&self, queue: &QueueId) -> Option<UintN> {
-        let recorded = self.closed.read().unwrap().get(queue).cloned().flatten();
-        recorded.or_else(|| self.get_last_id(queue).flatten())
+        self.recorded_last_id(queue)
+            .or_else(|| self.get_last_id(queue).flatten())
+    }
+
+    /// The last id a close in this process recorded, and nothing else.
+    pub fn recorded_last_id(&self, queue: &QueueId) -> Option<UintN> {
+        self.closed.read().unwrap().get(queue).cloned().flatten()
+    }
+
+    /// The highest id a close in this process recorded, through a reopen
+    /// whose start has not succeeded yet.
+    pub fn given_out(&self, queue: &QueueId) -> Option<UintN> {
+        let reopened = self.reopened.read().unwrap().get(queue).cloned();
+        self.recorded_last_id(queue).max(reopened)
     }
 
     /// Stops the write side. Waits for the in-flight append, reads the
@@ -1367,16 +1389,16 @@ impl MemStore {
         }
     }
 
-    /// Whether everything the queue accepted is on disk; the close marker
-    /// must not be written while this is false.
-    pub fn is_fully_durable(&self, queue: &QueueId) -> bool {
-        let pool = {
-            let queues = self.queues.read().unwrap();
-            queues
-                .get(queue)
-                .and_then(|q| q.inner.read().unwrap().pool.clone())
-        };
-        pool.is_none_or(|p| p.is_fully_durable())
+    /// A close began on this queue but did not finish, so it is still here.
+    pub fn is_closing(&self, queue: &QueueId) -> bool {
+        let queues = self.queues.read().unwrap();
+        queues
+            .get(queue)
+            .is_some_and(|q| q.closed.load(Ordering::Relaxed))
+    }
+
+    pub fn queue_ids(&self) -> Vec<QueueId> {
+        self.queues.read().unwrap().keys().cloned().collect()
     }
 
     /// Whether every record of the queue below `id` is on disk.
@@ -1388,6 +1410,21 @@ impl MemStore {
                 .and_then(|q| q.inner.read().unwrap().pool.clone())
         };
         pool.is_some_and(|p| p.is_durable_below(id))
+    }
+
+    /// What the queue owes the disk up to the last id it took.
+    pub fn debt(&self, queue: &QueueId) -> Debt {
+        let taken = {
+            let queues = self.queues.read().unwrap();
+            queues.get(queue).and_then(|q| {
+                let inner = q.inner.read().unwrap();
+                Some((inner.last_id.as_ref().map(id_to_u64)?, inner.pool.clone()?))
+            })
+        };
+        match taken {
+            Some((last, pool)) => pool.debt(last),
+            None => Debt::Clear,
+        }
     }
 
     /// Ends a closed queue's life in memory: subscriber streams end and the

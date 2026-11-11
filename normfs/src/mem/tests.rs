@@ -1401,3 +1401,57 @@ async fn a_held_start_waits_for_the_append_in_flight() {
     assert!(parked.await.unwrap().is_some());
     held.await.unwrap();
 }
+
+// A later file's flush moves the durable mark past an earlier stranded tail.
+#[tokio::test]
+async fn a_stranded_tail_stays_owed_after_the_mark_passes_it() {
+    let mem = Arc::new(mem_store(1024 * 1024));
+    let queue = QueueIdResolver::new(TEST_INSTANCE_ID).resolve("owed");
+    mem.start_queue(&queue, None, false, PoolKind::Active);
+    let pool = mem.pool(&queue).unwrap();
+    pool.set_drainer();
+    pool.arm_file_fill(1 << 20, 16);
+
+    for d in create_test_data(2) {
+        mem.enqueue_awaiting(&queue, d).await.unwrap();
+    }
+    pool.note_handed_over(1);
+    assert!(pool.take_stranded(0).is_some());
+    pool.mark_durable(2);
+
+    assert_eq!(mem.debt(&queue), normfs_wal::Debt::Owed);
+}
+
+#[tokio::test]
+async fn a_reopen_remembers_the_ids_given_out_until_a_start_succeeds() {
+    let mem = Arc::new(mem_store(1024 * 1024));
+    let queue = QueueIdResolver::new(TEST_INSTANCE_ID).resolve("given");
+    setup_queue_with_data(&mem, &queue, 2).await;
+    mem.begin_close(&queue).await;
+    mem.close_queue(&queue);
+
+    mem.reopen(&queue);
+    assert_eq!(mem.given_out(&queue), Some(UintN::from(1u64)));
+    mem.started_for_write(&queue);
+    assert_eq!(mem.given_out(&queue), None);
+}
+
+#[tokio::test]
+async fn only_the_abandoned_tail_is_lost_when_a_later_file_landed() {
+    let mem = Arc::new(mem_store(1024 * 1024));
+    let queue = QueueIdResolver::new(TEST_INSTANCE_ID).resolve("later");
+    mem.start_queue(&queue, None, false, PoolKind::Active);
+    let pool = mem.pool(&queue).unwrap();
+    pool.set_drainer();
+    pool.arm_file_fill(1 << 20, 16);
+
+    for d in create_test_data(3) {
+        mem.enqueue_awaiting(&queue, d).await.unwrap();
+    }
+    pool.note_handed_over(1);
+    let stranded = pool.take_stranded(0).unwrap();
+    pool.mark_durable(3);
+    pool.abandon_stranded(stranded.generation, 0);
+
+    assert_eq!(mem.debt(&queue), normfs_wal::Debt::Abandoned(vec![(0, 1)]));
+}

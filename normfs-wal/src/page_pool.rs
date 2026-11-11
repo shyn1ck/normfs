@@ -34,7 +34,7 @@
 //! responsible for never advancing the watermark on anything less than a
 //! completed sync.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -308,7 +308,7 @@ pub struct Stranded {
     pub first_entry_id: u64,
     pub last_entry_id: u64,
     /// The arming the file belonged to; with its epoch, what
-    /// [`PagePool::clear_stranded`] needs to clear this debt and no other.
+    /// [`PagePool::land_stranded`] needs to clear this debt and no other.
     pub generation: u64,
 }
 
@@ -393,7 +393,66 @@ struct Inner {
     handed_through: Option<u64>,
     /// First id a retry still owes, per stranded file; keyed by generation too,
     /// since epochs restart at 0 on every arming.
-    stranded: BTreeMap<(u64, u64), u64>,
+    stranded: BTreeMap<(u64, u64), (u64, u64)>,
+    /// Stranded files no retry can land; still owed, but nobody holds them.
+    abandoned: BTreeSet<(u64, u64)>,
+}
+
+fn mark_durable_locked(inner: &mut Inner, floor: usize, first_non_durable_id: u64) -> bool {
+    if first_non_durable_id <= inner.ring.min_essential_id() {
+        return false;
+    }
+    inner.ring.set_essential(first_non_durable_id);
+
+    // Advancing the watermark is the only event that can make a page
+    // reusable, so it is also the only moment a queue can discover it
+    // is holding more of the arena than it needs. Give the top pages
+    // back while they are safe to give, down to the floor.
+    //
+    // `release_page` refuses the active page, refuses to go below the
+    // floor, and checks `normfs_wal_page_reusable` -- which is the
+    // predicate `normfs_wal_ring_release_page` requires, not a
+    // restatement of it. So a page carrying records that are not yet on
+    // disk, or that a reader is holding, cannot leave this queue.
+    let mut released = 0usize;
+    while inner.ring.release_page(floor) {
+        released += 1;
+    }
+    // A released page can hold ids from the middle of the cached run;
+    // the floor rises past them so memory never serves across the gap.
+    inner.absorb_eviction();
+    if released > 0 {
+        let pages = inner.ring.page_count();
+        inner.written.resize(pages, 0);
+        inner.page_epoch.resize(pages, 0);
+        log::debug!(
+            target: "normfs-wal",
+            "page pool returned {released} page(s) to the arena, now {pages} pages",
+        );
+    }
+    true
+}
+
+/// What a queue owes the disk once its writer is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Debt {
+    Clear,
+    /// Only tails no retry can land: these id ranges never reach disk.
+    Abandoned(Vec<(u64, u64)>),
+    /// Something a retry may still land, or that no stranded tail accounts for.
+    Owed,
+}
+
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (first, end) in ranges {
+        match merged.last_mut() {
+            Some(prev) if first <= prev.1.saturating_add(1) => prev.1 = prev.1.max(end),
+            _ => merged.push((first, end)),
+        }
+    }
+    merged
 }
 
 fn first_id_at(inner: &Inner, k: usize, from: usize) -> Option<u64> {
@@ -707,6 +766,7 @@ impl PagePool {
                 cache_floor: 0,
                 handed_through: None,
                 stranded: BTreeMap::new(),
+                abandoned: BTreeSet::new(),
                 generation: next_generation(),
             }),
             space: Notify::new(),
@@ -771,6 +831,7 @@ impl PagePool {
                 cache_floor: 0,
                 handed_through: None,
                 stranded: BTreeMap::new(),
+                abandoned: BTreeSet::new(),
                 generation: next_generation(),
             }),
             space: Notify::new(),
@@ -918,7 +979,8 @@ impl PagePool {
     /// the writer syncs.
     pub fn is_durable_below(&self, id: u64) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.stranded.values().all(|&first| first >= id) && inner.ring.min_essential_id() >= id
+        inner.stranded.values().all(|&(first, _)| first >= id)
+            && inner.ring.min_essential_id() >= id
     }
 
     /// Whether a file writer is taking pages from this pool, and therefore
@@ -1605,7 +1667,9 @@ impl PagePool {
         let first_entry_id = runs[0].0.first_entry_id;
         let last_entry_id = runs[runs.len() - 1].0.last_entry_id;
         let generation = inner.generation;
-        inner.stranded.insert((generation, epoch), first_entry_id);
+        inner
+            .stranded
+            .insert((generation, epoch), (first_entry_id, last_entry_id));
 
         Some(Stranded {
             runs,
@@ -1615,21 +1679,98 @@ impl PagePool {
         })
     }
 
+    #[cfg(test)]
     pub fn clear_stranded(&self, generation: u64, epoch: u64) {
-        self.inner
-            .lock()
-            .unwrap()
-            .stranded
-            .remove(&(generation, epoch));
+        let mut inner = self.inner.lock().unwrap();
+        inner.stranded.remove(&(generation, epoch));
+        inner.abandoned.remove(&(generation, epoch));
+    }
+
+    /// A retry landed the file: marked durable and cleared under one lock, so
+    /// nobody sees the debt gone with the mark not yet past it.
+    pub fn land_stranded(&self, generation: u64, epoch: u64, first_non_durable_id: u64) {
+        let advanced = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.stranded.remove(&(generation, epoch));
+            inner.abandoned.remove(&(generation, epoch));
+            mark_durable_locked(&mut inner, self.floor, first_non_durable_id)
+        };
+        if advanced {
+            self.space.notify_waiters();
+        }
+    }
+
+    /// No retry can land the file. Its records stay owed, so nothing reports
+    /// them durable, but [`PagePool::is_retrying`] stops counting them.
+    pub fn abandon_stranded(&self, generation: u64, epoch: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.stranded.contains_key(&(generation, epoch)) {
+            inner.abandoned.insert((generation, epoch));
+        }
+    }
+
+    /// Ids from `first` up that no file will hold: owed, and abandoned from the
+    /// start, as no retry has them. Keyed past every epoch, so a stranded file
+    /// of this writer cannot overwrite it.
+    pub fn abandon_unwritten(&self, first: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(last) = inner.ring.next_entry_id().checked_sub(1) else {
+            return;
+        };
+        if first > last {
+            return;
+        }
+        let key = (inner.generation, u64::MAX);
+        inner.stranded.insert(key, (first, last));
+        inner.abandoned.insert(key);
     }
 
     pub fn has_stranded(&self) -> bool {
         !self.inner.lock().unwrap().stranded.is_empty()
     }
 
+    /// Whether a retry still holds a stranded file of this pool.
+    #[cfg(test)]
+    pub fn is_retrying(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.stranded.keys().any(|k| !inner.abandoned.contains(k))
+    }
+
+    /// What the queue still owes the disk up to `last`, in one look.
+    pub fn debt(&self, last: u64) -> Debt {
+        let inner = self.inner.lock().unwrap();
+        let tail = |&(first, end): &(u64, u64)| (first <= last).then_some((first, end.min(last)));
+        let mut owed: Vec<(u64, u64)> = inner.stranded.values().filter_map(tail).collect();
+        let mark = inner.ring.min_essential_id();
+        if mark <= last {
+            owed.push((mark, last));
+        }
+        let owed = merge_ranges(owed);
+        if owed.is_empty() {
+            return Debt::Clear;
+        }
+        let abandoned = merge_ranges(
+            inner
+                .stranded
+                .iter()
+                .filter(|(k, _)| inner.abandoned.contains(k))
+                .filter_map(|(_, r)| tail(r))
+                .collect(),
+        );
+        let covered = owed
+            .iter()
+            .all(|&(f, l)| abandoned.iter().any(|&(af, al)| af <= f && l <= al));
+        if covered {
+            Debt::Abandoned(abandoned)
+        } else {
+            Debt::Owed
+        }
+    }
+
     /// The first id this queue may not report durable.
     pub fn stranded_from(&self) -> Option<u64> {
-        self.inner.lock().unwrap().stranded.values().min().copied()
+        let inner = self.inner.lock().unwrap();
+        inner.stranded.values().map(|&(first, _)| first).min()
     }
 
     /// Marks a run from [`PagePool::take_pending`] as written. Only moves the
@@ -1663,41 +1804,13 @@ impl PagePool {
     /// to be overwritten as soon as this watermark passes its last entry, and it
     /// is right to do so exactly when the bytes are safe.
     pub fn mark_durable(&self, first_non_durable_id: u64) {
-        {
+        let advanced = {
             let mut inner = self.inner.lock().unwrap();
-            if first_non_durable_id <= inner.ring.min_essential_id() {
-                return;
-            }
-            inner.ring.set_essential(first_non_durable_id);
-
-            // Advancing the watermark is the only event that can make a page
-            // reusable, so it is also the only moment a queue can discover it
-            // is holding more of the arena than it needs. Give the top pages
-            // back while they are safe to give, down to the floor.
-            //
-            // `release_page` refuses the active page, refuses to go below the
-            // floor, and checks `normfs_wal_page_reusable` -- which is the
-            // predicate `normfs_wal_ring_release_page` requires, not a
-            // restatement of it. So a page carrying records that are not yet on
-            // disk, or that a reader is holding, cannot leave this queue.
-            let mut released = 0usize;
-            while inner.ring.release_page(self.floor) {
-                released += 1;
-            }
-            // A released page can hold ids from the middle of the cached run;
-            // the floor rises past them so memory never serves across the gap.
-            inner.absorb_eviction();
-            if released > 0 {
-                let pages = inner.ring.page_count();
-                inner.written.resize(pages, 0);
-                inner.page_epoch.resize(pages, 0);
-                log::debug!(
-                    target: "normfs-wal",
-                    "page pool returned {released} page(s) to the arena, now {pages} pages",
-                );
-            }
+            mark_durable_locked(&mut inner, self.floor, first_non_durable_id)
+        };
+        if advanced {
+            self.space.notify_waiters();
         }
-        self.space.notify_waiters();
     }
 
     /// Whether the writer still owes the file work.

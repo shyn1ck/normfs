@@ -1293,3 +1293,42 @@ async fn entries_parked_behind_the_last_one_to_arrive_reach_the_file() {
     }
     assert_eq!(ids, (0u64..6).map(UintN::from).collect::<Vec<_>>());
 }
+
+#[tokio::test]
+async fn entries_still_parked_at_close_are_abandoned_not_owed_for_ever() {
+    let dir = tempdir().unwrap();
+    let (written_tx, _written_rx) = mpsc::unbounded_channel();
+    let (complete_tx, _complete_rx) = mpsc::unbounded_channel();
+    let store = WalStore::new(dir.path(), written_tx, complete_tx);
+    let queue = QueueIdResolver::new("review").resolve("parked");
+    std::fs::create_dir_all(queue.to_wal_dir(dir.path())).unwrap();
+    let pool = std::sync::Arc::new(crate::PagePool::new(4, 1024, 0));
+    store
+        .start_writer_with_pool(
+            &queue,
+            &UintN::from(1u64),
+            WalHeader::default(),
+            WalSettings::default(),
+            None,
+            Some(pool.clone()),
+        )
+        .await
+        .unwrap();
+    // Id 0 is placed but never handed over, so 1 and 2 wait behind it.
+    let mut placements = Vec::new();
+    for id in 0..3u64 {
+        placements.push(pool.place(id, &[7; 200]).await.unwrap());
+    }
+    for id in 1..3u64 {
+        store
+            .enqueue_pooled(
+                &queue,
+                UintN::from(id),
+                Bytes::new(),
+                placements[id as usize],
+            )
+            .unwrap();
+    }
+    assert!(store.close_writer(&queue).await.is_err());
+    assert_eq!(pool.debt(2), crate::Debt::Abandoned(vec![(0, 2)]));
+}
