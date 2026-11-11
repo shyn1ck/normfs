@@ -623,44 +623,39 @@ impl Placer {
         data: Bytes,
         placement: normfs_wal::Placement,
     ) -> Result<(), Error> {
-        match self
+        let handed = match self
             .queue_settings
             .get_config(queue.as_str())
             .persist
             .drainer()
         {
-            Drainer::None => {
-                self.memory_pointers
-                    .mark(queue, entry_id)
-                    .map_err(Error::Io)?;
-                self.mem.ack(queue, entry_id);
-            }
-            Drainer::Wal => {
-                self.wal
-                    .enqueue_pooled(queue, entry_id.clone(), data, placement)?;
-            }
-            Drainer::Page => {}
+            Drainer::None => self
+                .memory_pointers
+                .mark(queue, entry_id)
+                .map_err(Error::Io)
+                .map(|()| self.mem.ack(queue, entry_id)),
+            Drainer::Wal => self
+                .wal
+                .enqueue_pooled(queue, entry_id.clone(), data, placement)
+                .map_err(Error::from),
+            Drainer::Page => Ok(()),
+        };
+        if let Err(e) = &handed {
+            log::warn!(target: "normfs", "queue '{}': record {entry_id} placed but not handed on: {e}", queue.short());
         }
-        Ok(())
+        handed
     }
 
     /// Waits for a page. `None` when the queue is closed or not started, or
     /// its drainer refused the record.
     pub(crate) async fn append(&self, queue: &QueueId, data: Bytes) -> Option<UintN> {
-        let handed = self
-            .mem
+        self.mem
             .enqueue_handed(queue, data, |id, data, placement| {
                 self.after_place(queue, id, data, placement)
-                    .map_err(|e| (id.clone(), e))
             })
-            .await;
-        match handed {
-            Ok(id) => id,
-            Err((id, e)) => {
-                log::warn!(target: "normfs", "queue '{}': record {id} placed but not handed on: {e}", queue.short());
-                None
-            }
-        }
+            .await
+            .ok()
+            .flatten()
     }
 }
 
@@ -1050,7 +1045,8 @@ impl NormFS {
         }
 
         log::info!(target: "normfs", "Auto-starting queue '{}' in readonly mode for read request", queue.short());
-        self.start_queue(queue, QueueMode { readonly: true }, None)
+        let given_out = self.mem.given_out(queue);
+        self.start_queue(queue, QueueMode { readonly: true }, given_out)
             .await
     }
 
@@ -1069,9 +1065,8 @@ impl NormFS {
             self.finish_close(queue).await?;
         }
 
-        // Read before the reopen forgets it: ids a client was given that never
-        // landed are not given out again.
-        let given_out = self.mem.recorded_last_id(queue);
+        // Ids a client was given that never landed are not given out again.
+        let given_out = self.mem.given_out(queue);
         if self.queue_closed_durably(queue).await {
             self.reopen_queue(queue).await?;
         }
@@ -1094,7 +1089,9 @@ impl NormFS {
         }
 
         self.start_queue(queue, QueueMode { readonly: false }, given_out)
-            .await
+            .await?;
+        self.mem.started_for_write(queue);
+        Ok(())
     }
 
     /// Ends a close that came back incomplete, so the start that follows is an
@@ -1109,7 +1106,12 @@ impl NormFS {
                     "queue '{}': records {first}..={last} are owed to disk but neither a writer nor \
                      a retry holds them, so they never land; the queue restarts past them",
                     queue.short());
+                let last_id = self.mem.closed_last_id(queue);
                 self.mem.close_queue(queue);
+                self.events.emit(SystemEvent::QueueClosed {
+                    queue: queue.clone(),
+                    last_id,
+                });
                 return Ok(());
             }
         }
@@ -1910,8 +1912,16 @@ impl NormFS {
             .into());
         }
 
-        let (file_id, header, last_entry_id, unchecked) =
+        let (file_id, mut header, mut last_entry_id, unchecked) =
             self.resume_point(queue, persist, given_out).await?;
+        // A queue still in memory, say from a failed start, numbers from its
+        // own last id, so its writer has to expect the same next id.
+        if let Some(Some(mem_last)) = self.mem.get_last_id(queue) {
+            if last_entry_id.as_ref().is_none_or(|l| mem_last > *l) {
+                header.num_entries_before = mem_last.increment();
+                last_entry_id = Some(mem_last);
+            }
+        }
 
         log::info!(target: "normfs", "----------------------------------------");
         log::info!(target: "normfs", "Queue '{}' - Recovery complete:", queue.short());

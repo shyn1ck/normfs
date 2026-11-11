@@ -1368,3 +1368,17 @@ async fn a_stranded_tail_stays_owed_after_the_mark_passes_it() {
 
     assert_eq!(mem.owed(&queue), Some((0, 1)));
 }
+
+#[tokio::test]
+async fn a_reopen_remembers_the_ids_given_out_until_a_start_succeeds() {
+    let mem = Arc::new(mem_store(1024 * 1024));
+    let queue = QueueIdResolver::new(TEST_INSTANCE_ID).resolve("given");
+    setup_queue_with_data(&mem, &queue, 2).await;
+    mem.begin_close(&queue).await;
+    mem.close_queue(&queue);
+
+    mem.reopen(&queue);
+    assert_eq!(mem.given_out(&queue), Some(UintN::from(1u64)));
+    mem.started_for_write(&queue);
+    assert_eq!(mem.given_out(&queue), None);
+}

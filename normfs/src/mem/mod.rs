@@ -117,6 +117,9 @@ pub struct MemStore {
     /// the queue from the map above, and a later follow still needs to know
     /// where the sequence ended. A reopen removes the entry.
     closed: RwLock<HashMap<QueueId, Option<UintN>>>,
+    /// A reopened queue's recorded last id, kept until a start succeeds so a
+    /// failed one cannot hand those ids out again.
+    reopened: RwLock<HashMap<QueueId, UintN>>,
     events: EventSink,
 }
 
@@ -1148,6 +1151,7 @@ impl MemStore {
             passive_arena,
             next_ring_id: AtomicU64::new(0),
             closed: RwLock::new(HashMap::new()),
+            reopened: RwLock::new(HashMap::new()),
             events: normfs_types::events::discard(),
         })
     }
@@ -1320,7 +1324,13 @@ impl MemStore {
     }
 
     pub fn reopen(&self, queue: &QueueId) {
-        self.closed.write().unwrap().remove(queue);
+        if let Some(Some(last)) = self.closed.write().unwrap().remove(queue) {
+            self.reopened.write().unwrap().insert(queue.clone(), last);
+        }
+    }
+
+    pub fn started_for_write(&self, queue: &QueueId) {
+        self.reopened.write().unwrap().remove(queue);
     }
 
     /// The last id a closed queue ever assigned; `None` means it never
@@ -1333,6 +1343,13 @@ impl MemStore {
     /// The last id a close in this process recorded, and nothing else.
     pub fn recorded_last_id(&self, queue: &QueueId) -> Option<UintN> {
         self.closed.read().unwrap().get(queue).cloned().flatten()
+    }
+
+    /// The highest id a close in this process recorded, through a reopen
+    /// whose start has not succeeded yet.
+    pub fn given_out(&self, queue: &QueueId) -> Option<UintN> {
+        let reopened = self.reopened.read().unwrap().get(queue).cloned();
+        self.recorded_last_id(queue).max(reopened)
     }
 
     /// Stops the write side. Waits for the in-flight append, reads the

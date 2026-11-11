@@ -976,3 +976,31 @@ async fn a_failed_reopen_does_not_leave_the_queue_closed_in_memory() {
     );
     fs.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_failed_start_after_an_abandoned_tail_keeps_its_ids() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = NormFS::new(temp.path().to_path_buf(), failing_flush_settings())
+        .await
+        .unwrap();
+    let queue = fs.resolve("fatal");
+    let first = strand_two_records(&fs, &queue, temp.path()).await;
+    std::fs::remove_file(&first).unwrap();
+    normfs_wal::heal(&first);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let wal = queue.to_wal_dir(temp.path());
+    std::fs::remove_dir_all(&wal).unwrap();
+    std::fs::write(&wal, b"not a directory").unwrap();
+    assert!(fs.ensure_queue_exists_for_write(&queue).await.is_err());
+    std::fs::remove_file(&wal).unwrap();
+    std::fs::create_dir_all(&wal).unwrap();
+
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    let id = fs
+        .enqueue(&queue, Bytes::from_static(b"after"))
+        .await
+        .unwrap();
+    assert_eq!(id, UintN::from(2u64));
+    fs.close().await.unwrap();
+}
