@@ -55,13 +55,16 @@ pub(crate) fn spawn(
                 // Left owed on purpose: a close certifies that everything
                 // accepted is on disk, and saying "incomplete" for ever beats
                 // certifying the loss. A restart clears it.
+                pool.abandon_stranded(file.stranded.generation, file.epoch);
                 continue;
             }
             // The last file has no later flush to move the mark past its tail.
             // Monotone, and older debts still owed keep their own entries.
-            // Marked before the clear, so no debt is seen with no retry owning it.
-            pool.mark_durable(file.stranded.last_entry_id.saturating_add(1));
-            pool.clear_stranded(file.stranded.generation, file.epoch);
+            pool.land_stranded(
+                file.stranded.generation,
+                file.epoch,
+                file.stranded.last_entry_id.saturating_add(1),
+            );
             log::info!(
                 target: "normfs-wal",
                 "WAL drainer: queue '{}': file {} landed its tail, entries {}..={}",

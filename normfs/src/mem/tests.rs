@@ -1348,3 +1348,23 @@ fn reading_subscriber_does_not_deadlock_with_follow_and_ack() {
         );
     }
 }
+
+// A later file's flush moves the durable mark past an earlier stranded tail.
+#[tokio::test]
+async fn a_stranded_tail_stays_owed_after_the_mark_passes_it() {
+    let mem = Arc::new(mem_store(1024 * 1024));
+    let queue = QueueIdResolver::new(TEST_INSTANCE_ID).resolve("owed");
+    mem.start_queue(&queue, None, false, PoolKind::Active);
+    let pool = mem.pool(&queue).unwrap();
+    pool.set_drainer();
+    pool.arm_file_fill(1 << 20, 16);
+
+    for d in create_test_data(2) {
+        mem.enqueue_awaiting(&queue, d).await.unwrap();
+    }
+    pool.note_handed_over(1);
+    assert!(pool.take_stranded(0).is_some());
+    pool.mark_durable(2);
+
+    assert_eq!(mem.owed(&queue), Some((0, 1)));
+}

@@ -647,10 +647,16 @@ impl Placer {
     /// Waits for a page. `None` when the queue is closed or not started, or
     /// its drainer refused the record.
     pub(crate) async fn append(&self, queue: &QueueId, data: Bytes) -> Option<UintN> {
-        let (id, placement) = self.mem.enqueue_awaiting(queue, data.clone()).await?;
-        match self.after_place(queue, &id, data, placement) {
-            Ok(()) => Some(id),
-            Err(e) => {
+        let handed = self
+            .mem
+            .enqueue_handed(queue, data, |id, data, placement| {
+                self.after_place(queue, id, data, placement)
+                    .map_err(|e| (id.clone(), e))
+            })
+            .await;
+        match handed {
+            Ok(id) => id,
+            Err((id, e)) => {
                 log::warn!(target: "normfs", "queue '{}': record {id} placed but not handed on: {e}", queue.short());
                 None
             }
@@ -1044,7 +1050,8 @@ impl NormFS {
         }
 
         log::info!(target: "normfs", "Auto-starting queue '{}' in readonly mode for read request", queue.short());
-        self.start_queue(queue, QueueMode { readonly: true }).await
+        self.start_queue(queue, QueueMode { readonly: true }, None)
+            .await
     }
 
     pub async fn ensure_queue_exists_for_write(&self, queue: &QueueId) -> Result<(), Error> {
@@ -1062,8 +1069,10 @@ impl NormFS {
             self.finish_close(queue).await?;
         }
 
-        let reopening = self.queue_closed_durably(queue).await;
-        if reopening {
+        // Read before the reopen forgets it: ids a client was given that never
+        // landed are not given out again.
+        let given_out = self.mem.recorded_last_id(queue);
+        if self.queue_closed_durably(queue).await {
             self.reopen_queue(queue).await?;
         }
 
@@ -1074,36 +1083,31 @@ impl NormFS {
             Drainer::Page => self.store.has_page_writer(queue),
         };
 
-        if !(queue_exists && has_writer) {
-            if queue_exists {
-                log::info!(target: "normfs", "Restarting queue '{}' from readonly to write mode", queue.short());
-            } else {
-                log::info!(target: "normfs", "Auto-starting queue '{}' in write mode for write request", queue.short());
-            }
-            self.start_queue(queue, QueueMode { readonly: false })
-                .await?;
+        if queue_exists && has_writer {
+            return Ok(());
         }
 
-        // Only now: an append between the new pool and its writer would take
-        // an id the writer never hears of, and every later record waits on it.
-        if reopening {
-            self.mem.reopen(queue);
+        if queue_exists && !has_writer {
+            log::info!(target: "normfs", "Restarting queue '{}' from readonly to write mode", queue.short());
+        } else {
+            log::info!(target: "normfs", "Auto-starting queue '{}' in write mode for write request", queue.short());
         }
-        Ok(())
+
+        self.start_queue(queue, QueueMode { readonly: false }, given_out)
+            .await
     }
 
     /// Ends a close that came back incomplete, so the start that follows is an
     /// ordinary reopen. Refused while a retry still owns the tail's file id.
     async fn finish_close(&self, queue: &QueueId) -> Result<(), Error> {
         if self.persist_for(queue).drainer() != Drainer::None {
-            // Before `owed`: the drainer moves the durable mark, then clears.
-            if self.mem.pool(queue).is_some_and(|p| p.has_stranded()) {
+            if self.mem.pool(queue).is_some_and(|p| p.is_retrying()) {
                 return Err(Error::Wal(WalError::CloseIncomplete));
             }
             if let Some((first, last)) = self.mem.owed(queue) {
                 log::error!(target: "normfs",
-                    "queue '{}': records {first}..={last} were accepted but neither a writer nor a \
-                     retry holds them, so they never land; the queue restarts from disk",
+                    "queue '{}': records {first}..={last} are owed to disk but neither a writer nor \
+                     a retry holds them, so they never land; the queue restarts past them",
                     queue.short());
                 self.mem.close_queue(queue);
                 return Ok(());
@@ -1138,7 +1142,7 @@ impl NormFS {
         self.persist_for(queue).drainer() != Drainer::None && self.mem.owed(queue).is_some()
     }
 
-    /// Removes the marker so the queue can be started for write. It goes
+    /// Undoes a close so the queue can be started for write. The marker goes
     /// first and is synced, so a crash here leaves the queue closed rather
     /// than half-open; the start that follows recovers the last id from the
     /// files the close completed.
@@ -1152,6 +1156,7 @@ impl NormFS {
                 return Err(e.into());
             }
         }
+        self.mem.reopen(queue);
         Ok(())
     }
 
@@ -1812,6 +1817,7 @@ impl NormFS {
         &self,
         queue: &QueueId,
         persist: Persist,
+        given_out: Option<UintN>,
     ) -> Result<(UintN, normfs_wal::WalHeader, Option<UintN>, bool), Error> {
         let (mut file_id, mut header, mut last_id) = self.continue_queue(queue).await?;
 
@@ -1827,6 +1833,12 @@ impl NormFS {
         // Past the reserve too, even when the bucket answered: ids an earlier
         // life gave out and never landed are not given out again.
         if let Some(last) = self.memory_pointers.used_id(queue) {
+            if last_id.as_ref().is_none_or(|l| last > *l) {
+                last_id = Some(last);
+            }
+        }
+
+        if let Some(last) = given_out {
             if last_id.as_ref().is_none_or(|l| last > *l) {
                 last_id = Some(last);
             }
@@ -1855,7 +1867,12 @@ impl NormFS {
         });
     }
 
-    async fn start_queue(&self, queue: &QueueId, mode: QueueMode) -> Result<(), Error> {
+    async fn start_queue(
+        &self,
+        queue: &QueueId,
+        mode: QueueMode,
+        given_out: Option<UintN>,
+    ) -> Result<(), Error> {
         log::info!(target: "normfs", "========================================");
         log::info!(target: "normfs", "Starting queue: '{}' (readonly={})", queue.short(), mode.readonly);
         log::info!(target: "normfs", "========================================");
@@ -1893,7 +1910,8 @@ impl NormFS {
             .into());
         }
 
-        let (file_id, header, last_entry_id, unchecked) = self.resume_point(queue, persist).await?;
+        let (file_id, header, last_entry_id, unchecked) =
+            self.resume_point(queue, persist, given_out).await?;
 
         log::info!(target: "normfs", "----------------------------------------");
         log::info!(target: "normfs", "Queue '{}' - Recovery complete:", queue.short());
@@ -1905,7 +1923,7 @@ impl NormFS {
 
         // Started first: the writer is handed this queue's page pool, so the
         // pool has to exist before it.
-        self.mem.start_queue(
+        self.mem.start_queue_held(
             queue,
             last_entry_id.clone(),
             mode.readonly,
@@ -1996,6 +2014,7 @@ impl NormFS {
                     );
                 }
             }
+            self.mem.accept_appends(queue);
 
             // Files a previous life in WAL mode left behind are migrated
             // either way; a store-mode queue has none of its own.
@@ -2084,10 +2103,17 @@ impl NormFS {
             self.page_size_for(queue),
             self.settings.max_memory_usage,
         )?;
-        let Some((entry_id, placement)) = self.mem.enqueue_awaiting(queue, data.clone()).await
+        let len = data.len();
+        let Some(entry_id) = self
+            .mem
+            .enqueue_handed(queue, data, |id, data, placement| {
+                self.after_place(queue, id, data, placement)
+            })
+            .await?
         else {
-            // A close won the race after the check above. The record took
-            // no id, so refusing it costs the sequence nothing.
+            // A close won the race after the check above, or no writer is up
+            // yet. The record took no id, so refusing it costs the sequence
+            // nothing.
             return Err(if self.mem.is_closed(queue) {
                 Error::QueueClosed
             } else {
@@ -2096,9 +2122,7 @@ impl NormFS {
         };
 
         log::debug!(target: "normfs", "Enqueuing entry - Queue: '{}', Entry ID: {}, Data size: {} bytes",
-            queue.short(), entry_id, data.len());
-
-        self.after_place(queue, &entry_id, data, placement)?;
+            queue.short(), entry_id, len);
 
         log::trace!(target: "normfs", "Entry enqueued successfully - Queue: '{}', Entry ID: {}", queue.short(), entry_id);
 
@@ -2143,20 +2167,19 @@ impl NormFS {
             self.settings.max_memory_usage,
         )?;
 
-        let (entry_id, placement) = match self
+        match self
             .mem
-            .try_enqueue(queue, data.clone(), within)
+            .try_enqueue_handed(queue, data, within, |id, data, placement| {
+                self.after_place(queue, id, data, placement)
+            })?
             .ok_or(Error::QueueNotFound)?
         {
-            mem::TryEnqueue::Placed(id, placement) => (id, placement),
-            mem::TryEnqueue::Full => return Err(Error::WouldBlock),
-            mem::TryEnqueue::Closed => return Err(Error::QueueClosed),
-            mem::TryEnqueue::NotInFile => return Err(Error::NotInFile),
-        };
-
-        self.after_place(queue, &entry_id, data, placement)?;
-
-        Ok(entry_id)
+            mem::TryEnqueue::Placed(id, _) => Ok(id),
+            mem::TryEnqueue::Full => Err(Error::WouldBlock),
+            mem::TryEnqueue::Closed => Err(Error::QueueClosed),
+            mem::TryEnqueue::NotInFile => Err(Error::NotInFile),
+            mem::TryEnqueue::NoWriter => Err(Error::QueueNotFound),
+        }
     }
 
     /// [`NormFS::enqueue`] that gives up after `wait` with [`Error::WouldBlock`].

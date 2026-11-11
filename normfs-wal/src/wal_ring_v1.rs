@@ -649,6 +649,8 @@ impl WalRing {
         }
         self.ring.pool = pool;
         self.ring.first_slot = first_slot;
+        // As a new pool's: init zeroes the mark, which reads as every id owed.
+        self.set_essential(first_entry_id);
         if self.page_ref(self.ring.active).pin_count != 0 {
             // `free` is unpinned and the init above emptied every page, so
             // `normfs_wal_page_is_reusable` holds of it by construction and

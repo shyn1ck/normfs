@@ -721,7 +721,7 @@ async fn strand_two_records(
 }
 
 #[tokio::test]
-async fn a_restart_for_write_waits_for_a_tail_still_owed() {
+async fn a_restart_for_write_is_refused_while_a_tail_is_owed() {
     let temp = tempfile::TempDir::new().unwrap();
     let path = temp.path().to_path_buf();
     {
@@ -908,34 +908,71 @@ async fn appends_racing_a_restart_after_a_landed_tail_are_refused_or_land() {
 }
 
 #[tokio::test]
-async fn a_gap_no_retry_holds_does_not_latch_the_queue() {
+async fn an_append_no_writer_can_take_is_refused_without_an_id() {
     let temp = tempfile::TempDir::new().unwrap();
     let fs = NormFS::new(temp.path().to_path_buf(), NormFsSettings::all_active())
         .await
         .unwrap();
-    let queue = fs.resolve("gap");
-    // Read-started, so no writer: the record takes id 0 and nothing will
-    // ever write it.
+    let queue = fs.resolve("early");
     fs.ensure_queue_exists_for_read(&queue).await.unwrap();
-    let lost = fs.enqueue(&queue, Bytes::from_static(b"lost")).await;
+    let refused = fs.enqueue(&queue, Bytes::from_static(b"early")).await;
     assert!(
-        matches!(lost, Err(Error::Wal(normfs_wal::WalError::WriterNotFound))),
-        "got {lost:?}"
+        matches!(refused, Err(Error::QueueNotFound)),
+        "got {refused:?}"
     );
-    let closed = fs.close_queue(&queue).await;
+    let refused = fs.try_enqueue(&queue, Bytes::from_static(b"early"));
     assert!(
-        matches!(
-            closed,
-            Err(Error::Wal(normfs_wal::WalError::CloseIncomplete))
-        ),
-        "got {closed:?}"
+        matches!(refused, Err(Error::QueueNotFound)),
+        "got {refused:?}"
     );
+    assert!(matches!(fs.get_last_id(&queue), Err(Error::QueueEmpty)));
+    fs.close().await.unwrap();
+}
 
-    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
-    let id = fs
-        .enqueue(&queue, Bytes::from_static(b"record-0"))
+#[tokio::test]
+async fn a_tail_no_retry_can_land_does_not_latch_the_queue() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = NormFS::new(temp.path().to_path_buf(), failing_flush_settings())
         .await
         .unwrap();
-    assert_eq!(id, UintN::zero());
+    let queue = fs.resolve("fatal");
+    let first = strand_two_records(&fs, &queue, temp.path()).await;
+    // The retry reopens the file it owes, never creates it: gone is final.
+    std::fs::remove_file(&first).unwrap();
+    normfs_wal::heal(&first);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while let Err(e) = fs.ensure_queue_exists_for_write(&queue).await {
+        assert!(tokio::time::Instant::now() < deadline, "last answer {e:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let id = fs
+        .enqueue(&queue, Bytes::from_static(b"after"))
+        .await
+        .unwrap();
+    assert_eq!(id, UintN::from(2u64));
+    fs.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_reopen_does_not_leave_the_queue_closed_in_memory() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let fs = NormFS::new(temp.path().to_path_buf(), NormFsSettings::all_active())
+        .await
+        .unwrap();
+    let queue = fs.resolve("stuck");
+    fs.ensure_queue_exists_for_write(&queue).await.unwrap();
+    fs.close_queue(&queue).await.unwrap();
+    let wal = queue.to_wal_dir(temp.path());
+    std::fs::remove_dir_all(&wal).unwrap();
+    std::fs::write(&wal, b"not a directory").unwrap();
+
+    assert!(fs.ensure_queue_exists_for_write(&queue).await.is_err());
+    assert!(!queue.to_fs_path(temp.path()).join("closed").exists());
+    let refused = fs.enqueue(&queue, Bytes::from_static(b"late")).await;
+    assert!(
+        matches!(refused, Err(Error::QueueNotFound)),
+        "got {refused:?}"
+    );
     fs.close().await.unwrap();
 }
